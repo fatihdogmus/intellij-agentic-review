@@ -1,5 +1,6 @@
 package dev.fatihdogmus.agenticreview
 
+import com.intellij.openapi.application.ApplicationManager
 import com.intellij.testFramework.junit5.TestApplication
 import com.intellij.testFramework.junit5.fixture.projectFixture
 import dev.fatihdogmus.agenticreview.model.*
@@ -13,6 +14,7 @@ import dev.fatihdogmus.agenticreview.testutil.write
 import dev.fatihdogmus.agenticreview.vcs.BranchReviewMetadata
 import dev.fatihdogmus.agenticreview.vcs.ChangedFile
 import dev.fatihdogmus.agenticreview.vcs.ChangedFileStatus
+import dev.fatihdogmus.agenticreview.vcs.GitCommandFallback
 import dev.fatihdogmus.agenticreview.vcs.ReviewContent
 import kotlinx.serialization.json.Json
 import org.assertj.core.api.Assertions.assertThat
@@ -21,6 +23,8 @@ import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import java.nio.file.Files
 import java.nio.file.Path
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 
 @TestApplication
 class ReviewManagerServiceTest {
@@ -617,9 +621,14 @@ class ReviewManagerServiceTest {
         val comment = manager.findReview(review.id)!!.comments.single()
         assertThat(comment.status).isEqualTo(CommentStatus.RESOLVED)
         assertThat(comment.agentMetadata?.addressedBy).isEqualTo("opencode")
-        assertThat(comment.agentMetadata?.message).isEqualTo("done")
+        assertThat(comment.agentMetadata?.message).isNull()
         assertThat(comment.agentMetadata?.runId).isEqualTo("run-1")
         assertThat(comment.agentMetadata?.addressedAt).isNotBlank()
+        val reply = comment.replies.single()
+        assertThat(reply.body).isEqualTo("done")
+        assertThat(reply.kind).isEqualTo(ReplyKind.RESOLUTION)
+        assertThat(reply.authorKind).isEqualTo(ReplyAuthorKind.AGENT)
+        assertThat(reply.author).isEqualTo("opencode")
     }
 
     @Test
@@ -738,6 +747,279 @@ class ReviewManagerServiceTest {
 
         assertThat(changed).isFalse()
         assertThat(manager.findReview(review.id)?.seenFiles).hasSize(1)
+    }
+
+    @Test
+    fun addReplyAppendsWithoutChangingStatus() {
+        val manager = ReviewManagerService.getInstance(project)
+        val review = seededReview("add-reply")
+        ReviewStateService.getInstance(project).addReview(review)
+        val comment = manager.addComment(
+            review.id, sampleChangedFile("src/Foo.kt"), DiffSide.RIGHT, 1, "needs fix",
+        ) ?: error("comment missing")
+
+        val reply = manager.addReply(
+            commentId = comment.id,
+            body = "guarded at L42",
+            author = "codex",
+            authorKind = ReplyAuthorKind.AGENT,
+        )
+
+        assertThat(reply).isNotNull
+        assertThat(reply!!.id).isNotBlank()
+        assertThat(reply.commentId).isEqualTo(comment.id)
+        assertThat(reply.author).isEqualTo("codex")
+        assertThat(reply.authorKind).isEqualTo(ReplyAuthorKind.AGENT)
+        assertThat(reply.kind).isEqualTo(ReplyKind.COMMENT)
+        assertThat(reply.createdAt).isNotBlank()
+        assertThat(comment.replies).containsExactly(reply)
+        assertThat(comment.status).isEqualTo(CommentStatus.OPEN)
+    }
+
+    @Test
+    fun addReplyDefaultsToHumanAuthor() {
+        val manager = ReviewManagerService.getInstance(project)
+        val review = seededReview("human-reply")
+        ReviewStateService.getInstance(project).addReview(review)
+        val comment = manager.addComment(
+            review.id, sampleChangedFile("src/Foo.kt"), DiffSide.RIGHT, 1, "needs fix",
+        ) ?: error("comment missing")
+        val nonGitDir = Files.createTempDirectory("agentic-review-human-author-non-git")
+        manager.repositoryRootResolver = { nonGitDir.toString() }
+
+        val reply = manager.addReply(comment.id, "ah, missed that")
+
+        assertThat(reply).isNotNull
+        assertThat(reply!!.authorKind).isEqualTo(ReplyAuthorKind.HUMAN)
+        assertThat(reply.author).isNotBlank()
+        // git config still resolves to a global/system-level user.name outside a repo on some
+        // machines, so accept either leg of the documented fallback chain rather than assuming
+        // the git lookup always fails for a non-repo directory.
+        val gitConfigName = GitCommandFallback(nonGitDir.toString())
+            .runOrNull("config", "user.name")
+            ?.trim()
+            ?.takeIf { it.isNotEmpty() }
+        val systemPropertyName = System.getProperty("user.name")?.takeIf { it.isNotBlank() }
+        assertThat(reply.author).isIn(listOfNotNull(gitConfigName, systemPropertyName))
+    }
+
+    @Test
+    fun addReplyUsesGitConfigUserNameWhenAvailable() {
+        val manager = ReviewManagerService.getInstance(project)
+        val review = seededReview("human-reply-git-config")
+        ReviewStateService.getInstance(project).addReview(review)
+        val comment = manager.addComment(
+            review.id, sampleChangedFile("src/Foo.kt"), DiffSide.RIGHT, 1, "needs fix",
+        ) ?: error("comment missing")
+        val gitDir = Files.createTempDirectory("agentic-review-human-author-git-config")
+        initGitRepo(gitDir)
+        val sentinel = "Sentinel Author ${System.nanoTime()}"
+        runGit(gitDir, "config", "user.name", sentinel)
+        manager.repositoryRootResolver = { gitDir.toString() }
+
+        val reply = manager.addReply(comment.id, "picking this up")
+
+        assertThat(reply).isNotNull
+        assertThat(reply!!.authorKind).isEqualTo(ReplyAuthorKind.HUMAN)
+        assertThat(reply.author).isEqualTo(sentinel)
+    }
+
+    @Test
+    fun addReplyDefaultsToAgentAuthorForAgentKind() {
+        val manager = ReviewManagerService.getInstance(project)
+        val review = seededReview("agent-reply-default")
+        ReviewStateService.getInstance(project).addReview(review)
+        val comment = manager.addComment(
+            review.id, sampleChangedFile("src/Foo.kt"), DiffSide.RIGHT, 1, "needs fix",
+        ) ?: error("comment missing")
+
+        val reply = manager.addReply(comment.id, "will fix", author = null, authorKind = ReplyAuthorKind.AGENT)
+
+        assertThat(reply).isNotNull
+        assertThat(reply!!.author).isEqualTo("agent")
+        assertThat(reply.authorKind).isEqualTo(ReplyAuthorKind.AGENT)
+    }
+
+    @Test
+    fun addReplyUpdatesCommentAndReviewTimestampsAndNotifiesListeners() {
+        val manager = ReviewManagerService.getInstance(project)
+        val review = seededReview("reply-touch")
+        ReviewStateService.getInstance(project).addReview(review)
+        val comment = manager.addComment(
+            review.id, sampleChangedFile("src/Foo.kt"), DiffSide.RIGHT, 1, "needs fix",
+        ) ?: error("comment missing")
+        val commentUpdatedAtBefore = comment.updatedAt
+        val reviewUpdatedAtBefore = manager.findReview(review.id)!!.updatedAt
+        var notified = false
+        val listener = { notified = true }
+        manager.addListener(listener)
+
+        try {
+            ApplicationManager.getApplication().invokeAndWait {
+                manager.addReply(comment.id, "noted")
+            }
+
+            assertThat(comment.updatedAt).isNotEqualTo(commentUpdatedAtBefore)
+            assertThat(manager.findReview(review.id)!!.updatedAt).isNotEqualTo(reviewUpdatedAtBefore)
+            assertThat(notified).isTrue()
+        } finally {
+            manager.removeListener(listener)
+        }
+    }
+
+    @Test
+    fun addReplyPreservesOrderAndRejectsUnknownComment() {
+        val manager = ReviewManagerService.getInstance(project)
+        val review = seededReview("reply-order")
+        ReviewStateService.getInstance(project).addReview(review)
+        val comment = manager.addComment(
+            review.id, sampleChangedFile("src/Foo.kt"), DiffSide.RIGHT, 1, "needs fix",
+        ) ?: error("comment missing")
+
+        manager.addReply(comment.id, "first")
+        manager.addReply(comment.id, "second")
+
+        assertThat(comment.replies.map { it.body }).containsExactly("first", "second")
+        assertThat(manager.addReply("does-not-exist", "orphan")).isNull()
+    }
+
+    @Test
+    fun addReplyRejectsBlankBodyWithoutMutating() {
+        val manager = ReviewManagerService.getInstance(project)
+        val review = seededReview("blank-reply")
+        ReviewStateService.getInstance(project).addReview(review)
+        val comment = manager.addComment(
+            review.id, sampleChangedFile("src/Foo.kt"), DiffSide.RIGHT, 1, "needs fix",
+        ) ?: error("comment missing")
+
+        assertThat(manager.addReply(comment.id, "   ")).isNull()
+        assertThat(comment.replies).isEmpty()
+    }
+
+    @Test
+    fun addReplyToResolvedCommentDoesNotReopenIt() {
+        val manager = ReviewManagerService.getInstance(project)
+        val review = seededReview("reply-resolved")
+        ReviewStateService.getInstance(project).addReview(review)
+        val comment = manager.addComment(
+            review.id, sampleChangedFile("src/Foo.kt"), DiffSide.RIGHT, 1, "needs fix",
+        ) ?: error("comment missing")
+        manager.markCommentResolved(comment.id)
+
+        manager.addReply(comment.id, "one more thought")
+
+        assertThat(comment.status).isEqualTo(CommentStatus.RESOLVED)
+        assertThat(comment.replies.map { it.body }).containsExactly("one more thought")
+    }
+
+    @Test
+    fun markCommentResolvedAppendsResolutionReply() {
+        val manager = ReviewManagerService.getInstance(project)
+        val review = seededReview("resolve-reply")
+        ReviewStateService.getInstance(project).addReview(review)
+        val comment = manager.addComment(
+            review.id, sampleChangedFile("src/Foo.kt"), DiffSide.RIGHT, 1, "needs fix",
+        ) ?: error("comment missing")
+
+        manager.markCommentResolved(comment.id, message = "fixed in a1b2c3", agentName = "codex", runId = "run-7")
+
+        assertThat(comment.status).isEqualTo(CommentStatus.RESOLVED)
+        val reply = comment.replies.single()
+        assertThat(reply.body).isEqualTo("fixed in a1b2c3")
+        assertThat(reply.author).isEqualTo("codex")
+        assertThat(reply.authorKind).isEqualTo(ReplyAuthorKind.AGENT)
+        assertThat(reply.kind).isEqualTo(ReplyKind.RESOLUTION)
+        assertThat(reply.runId).isEqualTo("run-7")
+        assertThat(comment.agentMetadata?.message).isNull()
+        assertThat(comment.agentMetadata?.addressedBy).isEqualTo("codex")
+        assertThat(comment.agentMetadata?.runId).isEqualTo("run-7")
+    }
+
+    @Test
+    fun markCommentResolvedWithoutMessageAddsNoReply() {
+        val manager = ReviewManagerService.getInstance(project)
+        val review = seededReview("resolve-no-message")
+        ReviewStateService.getInstance(project).addReview(review)
+        val comment = manager.addComment(
+            review.id, sampleChangedFile("src/Foo.kt"), DiffSide.RIGHT, 1, "needs fix",
+        ) ?: error("comment missing")
+
+        manager.markCommentResolved(comment.id)
+
+        assertThat(comment.status).isEqualTo(CommentStatus.RESOLVED)
+        assertThat(comment.replies).isEmpty()
+    }
+
+    @Test
+    fun repeatedResolutionMessagesPreserveEarlierReplies() {
+        val manager = ReviewManagerService.getInstance(project)
+        val review = seededReview("resolve-twice")
+        ReviewStateService.getInstance(project).addReview(review)
+        val comment = manager.addComment(
+            review.id, sampleChangedFile("src/Foo.kt"), DiffSide.RIGHT, 1, "needs fix",
+        ) ?: error("comment missing")
+
+        manager.markCommentResolved(comment.id, message = "first pass")
+        manager.markCommentResolved(comment.id, message = "second pass")
+
+        assertThat(comment.replies.map { it.body }).containsExactly("first pass", "second pass")
+    }
+
+    @Test
+    fun savedArchiveRoundTripsReplies() {
+        val manager = ReviewManagerService.getInstance(project)
+        val review = seededCommitReview("archive-replies")
+        ReviewStateService.getInstance(project).addReview(review)
+        val comment = manager.addComment(
+            review.id, sampleChangedFile("src/Foo.kt"), DiffSide.RIGHT, 1, "needs fix",
+        ) ?: error("comment missing")
+        manager.addReply(comment.id, "guarded at L42", author = "codex", authorKind = ReplyAuthorKind.AGENT)
+
+        val plan = manager.prepareSaveReview(review.id, review.title) ?: error("save plan missing")
+        val archive = json.decodeFromString<SavedReviewArchive>(plan.payload)
+
+        val savedReply = archive.comments.single().replies.single()
+        assertThat(savedReply.body).isEqualTo("guarded at L42")
+        assertThat(savedReply.authorKind).isEqualTo(ReplyAuthorKind.AGENT)
+    }
+
+    @Test
+    fun concurrentAddReplyCallsDoNotLoseReplies() {
+        val manager = ReviewManagerService.getInstance(project)
+        val review = seededReview("concurrent-reply")
+        ReviewStateService.getInstance(project).addReview(review)
+        val comment = manager.addComment(
+            review.id, sampleChangedFile("src/Foo.kt"), DiffSide.RIGHT, 1, "needs fix",
+        ) ?: error("comment missing")
+
+        val threadCount = 8
+        val repliesPerThread = 200
+        val startLatch = CountDownLatch(1)
+        val doneLatch = CountDownLatch(threadCount)
+        val threads = (0 until threadCount).map { threadId ->
+            Thread {
+                startLatch.await()
+                try {
+                    repeat(repliesPerThread) { i ->
+                        manager.addReply(comment.id, "reply-$threadId-$i")
+                    }
+                } finally {
+                    doneLatch.countDown()
+                }
+            }.apply { isDaemon = true }
+        }
+        threads.forEach { it.start() }
+        startLatch.countDown()
+        assertThat(doneLatch.await(60, TimeUnit.SECONDS)).isTrue()
+        threads.forEach { it.join(30_000) }
+        assertThat(threads.any { it.isAlive }).isFalse()
+
+        val expectedBodies = (0 until threadCount).flatMap { threadId ->
+            (0 until repliesPerThread).map { i -> "reply-$threadId-$i" }
+        }.toSet()
+
+        assertThat(comment.replies).hasSize(threadCount * repliesPerThread)
+        assertThat(comment.replies.map { it.body }.toSet()).isEqualTo(expectedBodies)
     }
 
     private fun seededReview(suffix: String): Review = Review(

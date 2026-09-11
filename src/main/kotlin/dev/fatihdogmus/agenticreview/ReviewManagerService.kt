@@ -247,7 +247,14 @@ class ReviewManagerService(private val project: Project) : Disposable {
             updatedAt = archive.updatedAt.ifBlank { now },
             status = archive.reviewStatus,
             comments = archive.comments.map { comment ->
-                comment.copy(id = UUID.randomUUID().toString(), reviewId = reviewId)
+                val newCommentId = UUID.randomUUID().toString()
+                comment.copy(
+                    id = newCommentId,
+                    reviewId = reviewId,
+                    replies = comment.replies
+                        .map { it.copy(commentId = newCommentId) }
+                        .toMutableList(),
+                )
             }.toMutableList(),
         )
         stateService.addReview(review)
@@ -331,6 +338,53 @@ class ReviewManagerService(private val project: Project) : Disposable {
         return false
     }
 
+    fun addReply(
+        commentId: String,
+        body: String,
+        author: String? = null,
+        authorKind: ReplyAuthorKind = ReplyAuthorKind.HUMAN,
+        kind: ReplyKind = ReplyKind.COMMENT,
+        runId: String? = null,
+    ): CommentReply? {
+        val application = ApplicationManager.getApplication()
+        if (application.isDispatchThread) {
+            return addReplyOnEdt(commentId, body, author, authorKind, kind, runId)
+        }
+        var result: CommentReply? = null
+        application.invokeAndWait {
+            result = addReplyOnEdt(commentId, body, author, authorKind, kind, runId)
+        }
+        return result
+    }
+
+    private fun addReplyOnEdt(
+        commentId: String,
+        body: String,
+        author: String?,
+        authorKind: ReplyAuthorKind,
+        kind: ReplyKind,
+        runId: String?,
+    ): CommentReply? {
+        val trimmedBody = body.trim()
+        if (trimmedBody.isEmpty()) return null
+        val (review, comment) = findComment(commentId) ?: return null
+        val reply = CommentReply(
+            id = UUID.randomUUID().toString(),
+            commentId = commentId,
+            author = author?.takeIf { it.isNotBlank() }
+                ?: if (authorKind == ReplyAuthorKind.AGENT) "agent" else humanAuthor(),
+            authorKind = authorKind,
+            kind = kind,
+            body = trimmedBody,
+            createdAt = nowIso(),
+            runId = runId,
+        )
+        comment.replies.add(reply)
+        comment.updatedAt = nowIso()
+        touch(review)
+        return reply
+    }
+
     fun markCommentResolved(
         commentId: String,
         message: String? = null,
@@ -338,15 +392,23 @@ class ReviewManagerService(private val project: Project) : Disposable {
         runId: String? = null
     ): Boolean {
         val (_, comment) = findComment(commentId) ?: return false
-        comment.agentMetadata = if (message != null || agentName != null || runId != null) {
-            AgentMetadata(
+        if (message != null || agentName != null || runId != null) {
+            comment.agentMetadata = AgentMetadata(
                 addressedBy = agentName,
                 addressedAt = nowIso(),
-                message = message,
+                message = null,
                 runId = runId,
             )
-        } else {
-            comment.agentMetadata
+        }
+        if (!message.isNullOrBlank()) {
+            addReply(
+                commentId = commentId,
+                body = message,
+                author = agentName,
+                authorKind = ReplyAuthorKind.AGENT,
+                kind = ReplyKind.RESOLUTION,
+                runId = runId,
+            )
         }
         return setCommentStatus(commentId, CommentStatus.RESOLVED)
     }
@@ -522,6 +584,22 @@ class ReviewManagerService(private val project: Project) : Disposable {
         return null
     }
 
+    private var cachedHumanAuthor: String? = null
+
+    private fun humanAuthor(): String {
+        cachedHumanAuthor?.let { return it }
+        val resolved = runCatching {
+            GitCommandFallback(repositoryRootResolver())
+                .runOrNull("config", "user.name")
+                ?.trim()
+                ?.takeIf { it.isNotEmpty() }
+        }.getOrNull()
+            ?: System.getProperty("user.name")?.takeIf { it.isNotBlank() }
+            ?: "you"
+        cachedHumanAuthor = resolved
+        return resolved
+    }
+
     private fun touch(review: Review) {
         review.updatedAt = nowIso()
         notifyChanged()
@@ -593,6 +671,13 @@ private fun SavedReviewArchive.validatedForImport(): SavedReviewArchive {
             validate(ReviewComment::body).isNotBlank()
             validate(ReviewComment::createdAt).isNotBlank()
             validate(ReviewComment::updatedAt).isNotBlank()
+        }
+        comment.replies.forEach { reply ->
+            validate(reply) {
+                validate(CommentReply::id).isNotBlank()
+                validate(CommentReply::body).isNotBlank()
+                validate(CommentReply::createdAt).isNotBlank()
+            }
         }
     }
     when (targetType) {
