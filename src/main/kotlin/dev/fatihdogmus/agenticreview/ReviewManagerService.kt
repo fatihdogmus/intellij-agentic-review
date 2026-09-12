@@ -27,6 +27,7 @@ import org.valiktor.validate
 import java.nio.file.Files
 import java.nio.file.Path
 import java.util.*
+import java.util.concurrent.ConcurrentHashMap
 
 @Service(Service.Level.PROJECT)
 class ReviewManagerService(private val project: Project) : Disposable {
@@ -34,6 +35,14 @@ class ReviewManagerService(private val project: Project) : Disposable {
     private val turnSnapshotService = TurnSnapshotService.getInstance(project)
     private val diffContextExtractor = DiffContextExtractor()
     private val listeners = mutableSetOf<() -> Unit>()
+
+    /**
+     * Ids of resolved comments the user has expanded in this project session. View state only:
+     * never serialized, never notifies listeners. Thread-safe because [setCommentStatus] mutates it
+     * and is reached from MCP coroutine threads without EDT marshalling. Note that any real status
+     * transition (via [setCommentStatus]) silently clears the comment's id from this set.
+     */
+    private val expandedResolvedComments: MutableSet<String> = ConcurrentHashMap.newKeySet()
     private val archiveJson = Json { prettyPrint = true; encodeDefaults = true; ignoreUnknownKeys = true }
     internal var uncommittedChangesLoader: () -> List<ChangedFile> =
         { UncommittedChangesProvider(project).getChangedFiles() }
@@ -332,6 +341,7 @@ class ReviewManagerService(private val project: Project) : Disposable {
     fun deleteComment(commentId: String): Boolean {
         val (review, comment) = findComment(commentId) ?: return false
         if (review.comments.remove(comment)) {
+            expandedResolvedComments.remove(commentId)
             touch(review)
             return true
         }
@@ -385,6 +395,12 @@ class ReviewManagerService(private val project: Project) : Disposable {
         return reply
     }
 
+    /**
+     * Returns `true` only if this call transitioned the comment's status to [CommentStatus.RESOLVED].
+     * Returns `false` for a comment already RESOLVED (or missing) — but in the already-RESOLVED case,
+     * [agentMetadata][ReviewComment.agentMetadata] is still overwritten and a RESOLUTION reply may still
+     * be appended before that no-op check is reached, so `false` does not mean the call had no effect.
+     */
     fun markCommentResolved(
         commentId: String,
         message: String? = null,
@@ -413,11 +429,21 @@ class ReviewManagerService(private val project: Project) : Disposable {
         return setCommentStatus(commentId, CommentStatus.RESOLVED)
     }
 
+    /** Human-only reopen. Leaves [ReviewComment.replies] and [ReviewComment.agentMetadata] intact as history. */
+    fun markCommentOpen(commentId: String): Boolean = setCommentStatus(commentId, CommentStatus.OPEN)
+
+    fun isResolvedCommentExpanded(commentId: String): Boolean = commentId in expandedResolvedComments
+
+    fun setResolvedCommentExpanded(commentId: String, expanded: Boolean) {
+        if (expanded) expandedResolvedComments.add(commentId) else expandedResolvedComments.remove(commentId)
+    }
+
+    /** Returns every comment on [filePath], regardless of status, ordered by anchor line then creation time. */
     fun commentsForFile(reviewId: String, filePath: String): List<ReviewComment> =
         findReview(reviewId)
             ?.comments
             ?.asSequence()
-            ?.filter { it.filePath == filePath && it.status == CommentStatus.OPEN }
+            ?.filter { it.filePath == filePath }
             ?.sortedWith(compareBy({ it.anchor.newLine ?: it.anchor.oldLine ?: Int.MAX_VALUE }, { it.createdAt }))
             ?.toList()
             .orEmpty()
@@ -483,8 +509,10 @@ class ReviewManagerService(private val project: Project) : Disposable {
 
     private fun setCommentStatus(commentId: String, status: CommentStatus): Boolean {
         val (review, comment) = findComment(commentId) ?: return false
+        if (comment.status == status) return false
         comment.status = status
         comment.updatedAt = nowIso()
+        expandedResolvedComments.remove(commentId)
         touch(review)
         return true
     }

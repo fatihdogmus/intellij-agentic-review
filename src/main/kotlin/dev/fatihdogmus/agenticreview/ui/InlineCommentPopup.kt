@@ -12,13 +12,17 @@ import com.intellij.openapi.editor.addComponentInlay
 import com.intellij.openapi.editor.ex.EditorEx
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.util.Disposer
+import com.intellij.openapi.util.text.StringUtil
 import com.intellij.ui.JBColor
+import com.intellij.ui.SimpleColoredComponent
+import com.intellij.ui.SimpleTextAttributes
 import com.intellij.ui.components.JBTextArea
 import com.intellij.util.IconUtil
 import com.intellij.util.ui.JBUI
 import dev.fatihdogmus.agenticreview.ReviewManagerService
 import dev.fatihdogmus.agenticreview.diff.ReviewDiffRequestData
 import dev.fatihdogmus.agenticreview.model.CommentReply
+import dev.fatihdogmus.agenticreview.model.CommentStatus
 import dev.fatihdogmus.agenticreview.model.ReplyKind
 import dev.fatihdogmus.agenticreview.model.ReviewComment
 import dev.fatihdogmus.agenticreview.model.thread
@@ -239,41 +243,210 @@ private fun showExistingCommentInlay(
     return inlay
 }
 
+/** Test seam for behaviour that cannot be driven through real Swing/AWT input in a headless test. */
+internal interface ExistingCommentPanelTestAccess {
+    /**
+     * Returns the action group the "⋯" menu button last built and captured for itself, right before
+     * attempting to show the (headlessly undriveable) popup. Tests must click the real button first —
+     * this does not build a fresh, independent group — so a broken button-to-group wire fails the test.
+     */
+    fun commentActionsGroupForTest(): DefaultActionGroup
+
+    /** Number of times [ExistingCommentPanel]'s private refreshLayout() has run, for tests. */
+    fun refreshLayoutCallCountForTest(): Int
+
+    /** Substitutes the panel's Inlay reference, e.g. with a recording wrapper that observes update() calls. */
+    fun setInlayRefForTest(inlay: Inlay<*>)
+}
+
 private class ExistingCommentPanel(
     private val project: Project,
     private val editor: EditorEx,
     private val comment: ReviewComment,
-) : JPanel(BorderLayout(0, 6)) {
+) : JPanel(BorderLayout(0, 6)), ExistingCommentPanelTestAccess {
 
     var inlayRef: Inlay<*>? = null
-    private val normalBackground = editor.colorsScheme.defaultBackground
-    private var editing = false
-    private val menuButton: JButton
-    private val body: JBTextArea
-    private val editActionsPanel: JPanel
-    private val repliesPanel = JPanel().apply {
-        isOpaque = false
-        layout = BoxLayout(this, BoxLayout.Y_AXIS)
-        alignmentX = LEFT_ALIGNMENT
-    }
-    private val replyTextArea = JBTextArea(2, 40).apply {
-        lineWrap = true
-        wrapStyleWord = true
-        border = JBUI.Borders.empty(8, 10)
-        background = INPUT_BG
-    }
+    private val manager = ReviewManagerService.getInstance(project)
+    private var card: JComponent? = null
+    private var refreshLayoutCallCount = 0
+
+    /** Set by the real "⋯" menu button click, right before it attempts to show the popup. Test-only read. */
+    private var lastCommentActionsGroupForTest: DefaultActionGroup? = null
+
+    // Open-presentation widgets; only initialised by buildOpenCard().
+    private lateinit var body: JBTextArea
+    private lateinit var editActionsPanel: JPanel
+    private lateinit var repliesPanel: JPanel
+    private lateinit var replyTextArea: JBTextArea
     private lateinit var replyFormPanel: JPanel
-    private lateinit var replyActionsPanel: JPanel
+
+    private val lineLabel: String
 
     init {
         isOpaque = false
         border = JBUI.Borders.empty(8, 16, 10, 16)
-
         val line = comment.anchor.newLine ?: comment.anchor.oldLine ?: 0
         val endLine = comment.anchor.endNewLine ?: comment.anchor.endOldLine
-        val lineLabel = if (endLine != null && endLine > line) "Lines $line-$endLine" else "Line $line"
+        lineLabel = if (endLine != null && endLine > line) "Lines $line-$endLine" else "Line $line"
+        renderForCurrentStatus()
+    }
 
-        menuButton = JButton().apply {
+    /** Single rendering entry point: picks the presentation from [comment].status and expand state. */
+    private fun renderForCurrentStatus() {
+        card?.let { remove(it) }
+        val next = when {
+            comment.status != CommentStatus.RESOLVED -> buildOpenCard()
+            manager.isResolvedCommentExpanded(comment.id) -> buildExpandedResolvedCard()
+            else -> buildCollapsedResolvedCard()
+        }
+        card = next
+        add(next, BorderLayout.CENTER)
+    }
+
+    /**
+     * Shared post-transition path for Resolve and Reopen. When this diff is hosted by
+     * ReviewToolWindowPanel, the service's synchronous listener has already rebuilt the diff and
+     * disposed this inlay before we get here — in that case this panel is stale and must not touch it.
+     */
+    private fun onStatusTransition(changed: Boolean) {
+        if (!changed) return
+        if (inlayRef?.isValid != true) return
+        renderForCurrentStatus()
+        refreshLayout()
+    }
+
+    override fun commentActionsGroupForTest(): DefaultActionGroup =
+        lastCommentActionsGroupForTest ?: error("comment actions menu button was never clicked in this test")
+
+    override fun refreshLayoutCallCountForTest(): Int = refreshLayoutCallCount
+
+    override fun setInlayRefForTest(inlay: Inlay<*>) {
+        inlayRef = inlay
+    }
+
+    private fun toggleExpanded() {
+        manager.setResolvedCommentExpanded(comment.id, !manager.isResolvedCommentExpanded(comment.id))
+        renderForCurrentStatus()
+        refreshLayout()
+    }
+
+    // ---------------------------------------------------------------- resolved: collapsed
+
+    private fun buildCollapsedResolvedCard(): JComponent {
+        val summary = SimpleColoredComponent().apply {
+            isOpaque = false
+            appendWithClipping(
+                collapsedSummaryText(comment.body),
+                SimpleTextAttributes.REGULAR_ATTRIBUTES,
+                SimpleColoredComponent.DefaultFragmentTextClipper.INSTANCE,
+            )
+            toolTipText = fullBodyTooltip(comment.body)
+        }
+        return RoundedSurfacePanel(COMMENT_SURFACE_BG, COMMENT_BORDER, COMMENT_PANEL_ARC).apply {
+            layout = BorderLayout(JBUI.scale(8), 0)
+            border = JBUI.Borders.empty(6, 14)
+            add(resolvedHeaderWest(), BorderLayout.WEST)
+            add(summary, BorderLayout.CENTER)
+            add(expandToggleButton(expanded = false), BorderLayout.EAST)
+        }
+    }
+
+    // ---------------------------------------------------------------- resolved: expanded
+
+    private fun buildExpandedResolvedCard(): JComponent {
+        val header = JPanel(BorderLayout()).apply {
+            isOpaque = false
+            add(resolvedHeaderWest(), BorderLayout.WEST)
+            add(expandToggleButton(expanded = true), BorderLayout.EAST)
+        }
+        val bodyArea = JBTextArea(comment.body).apply {
+            isEditable = false
+            lineWrap = true
+            wrapStyleWord = true
+            border = JBUI.Borders.empty(2, 0)
+            background = COMMENT_SURFACE_BG
+            foreground = editor.colorsScheme.defaultForeground
+            font = font.deriveFont(font.size2D + 1f)
+            alignmentX = LEFT_ALIGNMENT
+        }
+        val thread = JPanel().apply {
+            isOpaque = false
+            layout = BoxLayout(this, BoxLayout.Y_AXIS)
+            alignmentX = LEFT_ALIGNMENT
+            comment.thread().forEach { add(createReplyBlock(it, editor)) }
+        }
+        val center = JPanel().apply {
+            isOpaque = false
+            layout = BoxLayout(this, BoxLayout.Y_AXIS)
+            add(bodyArea)
+            add(thread)
+        }
+        val reopenButton = JButton("Reopen").apply {
+            applyCommentActionStyle(primary = false)
+            addActionListener { onStatusTransition(reopenComment(project, comment.id)) }
+        }
+        val south = JPanel(FlowLayout(FlowLayout.RIGHT, 0, 0)).apply {
+            isOpaque = false
+            add(reopenButton)
+        }
+        return RoundedSurfacePanel(COMMENT_SURFACE_BG, COMMENT_BORDER, COMMENT_PANEL_ARC).apply {
+            layout = BorderLayout(0, JBUI.scale(10))
+            border = JBUI.Borders.empty(10, 14)
+            add(header, BorderLayout.NORTH)
+            add(center, BorderLayout.CENTER)
+            add(south, BorderLayout.SOUTH)
+        }
+    }
+
+    /** Fresh west/header panel for a resolved card: icon, line pill, and "Resolved" label. */
+    private fun resolvedHeaderWest(): JPanel = JPanel(FlowLayout(FlowLayout.LEFT, JBUI.scale(8), 0)).apply {
+        isOpaque = false
+        add(JLabel(resolvedIcon()))
+        add(createPillLabel(lineLabel))
+        add(JLabel("Resolved").apply { foreground = SUBTLE_TEXT })
+    }
+
+    private fun resolvedIcon(): Icon = IconUtil.colorize(AllIcons.Actions.Checked, BLUE_BORDER, false, false)
+
+    /**
+     * Swing renders a tooltip that starts with `<html>` as markup. We own the wrapper and put only
+     * escaped user text inside it, so a body that itself starts with `<html>` is displayed literally.
+     */
+    private fun fullBodyTooltip(body: String): String =
+        "<html>" + StringUtil.escapeXmlEntities(body).replace("\n", "<br>") + "</html>"
+
+    private fun expandToggleButton(expanded: Boolean): JButton = JButton().apply {
+        icon = if (expanded) AllIcons.General.ArrowUp else AllIcons.General.ArrowDown
+        text = null
+        toolTipText = if (expanded) "Collapse resolved comment" else "Expand resolved comment"
+        accessibleContext.accessibleName = toolTipText
+        isFocusable = true
+        isContentAreaFilled = false
+        isBorderPainted = false
+        isOpaque = false
+        preferredSize = JBUI.size(28, 28)
+        border = JBUI.Borders.empty(4)
+        cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+        putClientProperty("JButton.buttonType", "toolbar")
+        addActionListener { toggleExpanded() }
+    }
+
+    // ---------------------------------------------------------------- open
+
+    private fun buildOpenCard(): JComponent {
+        repliesPanel = JPanel().apply {
+            isOpaque = false
+            layout = BoxLayout(this, BoxLayout.Y_AXIS)
+            alignmentX = LEFT_ALIGNMENT
+        }
+        replyTextArea = JBTextArea(2, 40).apply {
+            lineWrap = true
+            wrapStyleWord = true
+            border = JBUI.Borders.empty(8, 10)
+            background = INPUT_BG
+        }
+
+        val menuButton = JButton().apply {
             icon = AllIcons.Actions.More
             text = null
             isFocusable = false
@@ -287,35 +460,8 @@ private class ExistingCommentPanel(
             isVisible = true
             putClientProperty("JButton.buttonType", "toolbar")
             addActionListener {
-                val group = DefaultActionGroup().apply {
-                    add(object : AnAction(
-                        "Edit comment",
-                        null,
-                        IconUtil.colorize(AllIcons.Actions.Edit, BLUE_BORDER, false, false)
-                    ) {
-                        override fun actionPerformed(e: AnActionEvent) {
-                            enterEditMode()
-                        }
-                    })
-                    add(object : AnAction(
-                        "Resolve comment",
-                        null,
-                        IconUtil.colorize(AllIcons.Actions.Checked, BLUE_BORDER, false, false)
-                    ) {
-                        override fun actionPerformed(e: AnActionEvent) {
-                            resolveCommentAndDismiss(project, comment.id, ::dismiss)
-                        }
-                    })
-                    add(object : AnAction(
-                        "Delete comment",
-                        null,
-                        IconUtil.colorize(AllIcons.General.Remove, DELETE_RED, false, false)
-                    ) {
-                        override fun actionPerformed(e: AnActionEvent) {
-                            deleteCommentAndDismiss(project, comment.id, ::dismiss)
-                        }
-                    })
-                }
+                val group = buildCommentActionsGroup()
+                lastCommentActionsGroupForTest = group
                 val menu = ActionManager.getInstance().createActionPopupMenu(COMMENT_ACTIONS_PLACE, group).component
                 menu.border = JBUI.Borders.compound(
                     BorderFactory.createLineBorder(COMMENT_BORDER, 1),
@@ -398,7 +544,7 @@ private class ExistingCommentPanel(
             applyCommentActionStyle(primary = false)
             addActionListener { showReplyForm() }
         }
-        replyActionsPanel = JPanel(FlowLayout(FlowLayout.LEFT, 0, 0)).apply {
+        val replyActionsPanel = JPanel(FlowLayout(FlowLayout.LEFT, 0, 0)).apply {
             isOpaque = false
             alignmentX = LEFT_ALIGNMENT
             add(replyButton)
@@ -418,16 +564,45 @@ private class ExistingCommentPanel(
             add(replyActionsPanel)
         }
 
-        val card = RoundedSurfacePanel(COMMENT_SURFACE_BG, COMMENT_BORDER, COMMENT_PANEL_ARC).apply {
+        val openCard = RoundedSurfacePanel(COMMENT_SURFACE_BG, COMMENT_BORDER, COMMENT_PANEL_ARC).apply {
             layout = BorderLayout(0, JBUI.scale(10))
             border = JBUI.Borders.empty(10, 14)
             add(header, BorderLayout.NORTH)
             add(centerPanel, BorderLayout.CENTER)
             add(southPanel, BorderLayout.SOUTH)
         }
-
-        add(card, BorderLayout.CENTER)
         renderReplies()
+        return openCard
+    }
+
+    private fun buildCommentActionsGroup(): DefaultActionGroup = DefaultActionGroup().apply {
+        add(object : AnAction(
+            "Edit comment",
+            null,
+            IconUtil.colorize(AllIcons.Actions.Edit, BLUE_BORDER, false, false)
+        ) {
+            override fun actionPerformed(e: AnActionEvent) {
+                enterEditMode()
+            }
+        })
+        add(object : AnAction(
+            "Resolve comment",
+            null,
+            IconUtil.colorize(AllIcons.Actions.Checked, BLUE_BORDER, false, false)
+        ) {
+            override fun actionPerformed(e: AnActionEvent) {
+                onStatusTransition(resolveComment(project, comment.id))
+            }
+        })
+        add(object : AnAction(
+            "Delete comment",
+            null,
+            IconUtil.colorize(AllIcons.General.Remove, DELETE_RED, false, false)
+        ) {
+            override fun actionPerformed(e: AnActionEvent) {
+                deleteCommentAndDismiss(project, comment.id, ::dismiss)
+            }
+        })
     }
 
     private fun renderReplies() {
@@ -461,13 +636,13 @@ private class ExistingCommentPanel(
     }
 
     private fun refreshLayout() {
+        refreshLayoutCallCount++
         revalidate()
         repaint()
         inlayRef?.update()
     }
 
     private fun enterEditMode() {
-        editing = true
         body.isEditable = true
         body.border = BorderFactory.createCompoundBorder(
             RoundedLineBorder(BLUE_BORDER, COMMENT_CARD_ARC),
@@ -481,7 +656,6 @@ private class ExistingCommentPanel(
     }
 
     private fun exitEditMode() {
-        editing = false
         body.isEditable = false
         body.border = JBUI.Borders.empty(2, 0)
         editActionsPanel.isVisible = false
@@ -528,6 +702,19 @@ private fun createCommentInputScrollPane(textArea: JBTextArea): JScrollPane = JS
     viewport.background = INPUT_BG
     viewport.isOpaque = true
     horizontalScrollBarPolicy = ScrollPaneConstants.HORIZONTAL_SCROLLBAR_NEVER
+}
+
+internal const val COLLAPSED_SUMMARY_BUDGET = 120
+
+/**
+ * One-line summary of a comment body for the collapsed resolved row: whitespace runs (including
+ * newlines) become single spaces, and the result never exceeds [COLLAPSED_SUMMARY_BUDGET] UTF-16
+ * units in total, ellipsis included. Final pixel fitting is done by the rendering component, not here.
+ */
+internal fun collapsedSummaryText(body: String): String {
+    val normalized = body.trim().replace(Regex("\\s+"), " ")
+    return if (normalized.length <= COLLAPSED_SUMMARY_BUDGET) normalized
+    else normalized.take(COLLAPSED_SUMMARY_BUDGET - 1) + "…"
 }
 
 private val REPLY_TIMESTAMP_FORMAT: DateTimeFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")
@@ -674,11 +861,13 @@ private class RoundedLineBorder(
     }
 }
 
-internal fun resolveCommentAndDismiss(project: Project, commentId: String, dismiss: () -> Unit): Boolean {
-    val changed = ReviewManagerService.getInstance(project).markCommentResolved(commentId)
-    if (changed) dismiss()
-    return changed
-}
+/** Resolves the comment. Does not dismiss — the panel re-renders itself in place via [onStatusTransition]. */
+internal fun resolveComment(project: Project, commentId: String): Boolean =
+    ReviewManagerService.getInstance(project).markCommentResolved(commentId)
+
+/** Human-only reopen. Does not dismiss — the panel re-renders itself in place via [onStatusTransition]. */
+internal fun reopenComment(project: Project, commentId: String): Boolean =
+    ReviewManagerService.getInstance(project).markCommentOpen(commentId)
 
 internal fun deleteCommentAndDismiss(project: Project, commentId: String, dismiss: () -> Unit): Boolean {
     val changed = ReviewManagerService.getInstance(project).deleteComment(commentId)

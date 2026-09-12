@@ -84,7 +84,7 @@ class ReviewManagerServiceTest {
     }
 
     @Test
-    fun commentsForFileReturnsOnlyOpenComments() {
+    fun commentsForFileReturnsResolvedCommentsToo() {
         val manager = ReviewManagerService.getInstance(project)
         val review = seededReview("open-only-comments")
         review.comments += ReviewComment(
@@ -121,7 +121,9 @@ class ReviewManagerServiceTest {
 
         val comments = manager.commentsForFile(review.id, "src/Foo.kt")
 
-        assertThat(comments).singleElement().extracting("body").isEqualTo("open")
+        assertThat(comments.map { it.id }).containsExactly("open-comment", "resolved-comment", "addressed-comment")
+        assertThat(comments.map { it.status })
+            .containsExactly(CommentStatus.OPEN, CommentStatus.RESOLVED, CommentStatus.RESOLVED)
     }
 
     @Test
@@ -632,6 +634,74 @@ class ReviewManagerServiceTest {
     }
 
     @Test
+    fun markCommentResolvedOnAlreadyResolvedCommentIsNoOp() {
+        val manager = ReviewManagerService.getInstance(project)
+        val review = seededCommitReview("resolve-twice")
+        ReviewStateService.getInstance(project).addReview(review)
+        manager.addComment(review.id, sampleChangedFile("src/Foo.kt"), DiffSide.RIGHT, 1, "todo")
+        val commentId = manager.findReview(review.id)!!.comments.single().id
+        assertThat(manager.markCommentResolved(commentId)).isTrue()
+        val updatedAtAfterFirstResolve = manager.findReview(review.id)!!.comments.single().updatedAt
+
+        var notifications = 0
+        val listener = { notifications += 1 }
+        manager.addListener(listener)
+        try {
+            assertThat(manager.markCommentResolved(commentId)).isFalse()
+        } finally {
+            manager.removeListener(listener)
+        }
+
+        assertThat(notifications).isZero()
+        assertThat(manager.findReview(review.id)!!.comments.single().updatedAt).isEqualTo(updatedAtAfterFirstResolve)
+    }
+
+    @Test
+    fun markCommentOpenReopensResolvedCommentAndKeepsHistory() {
+        val manager = ReviewManagerService.getInstance(project)
+        val review = seededCommitReview("reopen")
+        ReviewStateService.getInstance(project).addReview(review)
+        manager.addComment(review.id, sampleChangedFile("src/Foo.kt"), DiffSide.RIGHT, 1, "todo")
+        val commentId = manager.findReview(review.id)!!.comments.single().id
+        manager.markCommentResolved(commentId, message = "done in a1b2c3", agentName = "codex", runId = "run-1")
+        // Pin a stale timestamp so the assertion below proves reopen actually bumps it.
+        manager.findReview(review.id)!!.comments.single().updatedAt = "2000-01-01T00:00:00Z"
+
+        assertThat(manager.markCommentOpen(commentId)).isTrue()
+
+        val comment = manager.findReview(review.id)!!.comments.single()
+        assertThat(comment.status).isEqualTo(CommentStatus.OPEN)
+        assertThat(comment.updatedAt).isNotEqualTo("2000-01-01T00:00:00Z")
+        assertThat(comment.replies.map { it.body }).containsExactly("done in a1b2c3")
+        assertThat(comment.agentMetadata?.addressedBy).isEqualTo("codex")
+    }
+
+    @Test
+    fun markCommentOpenReturnsFalseForUnknownIdAndAlreadyOpenComment() {
+        val manager = ReviewManagerService.getInstance(project)
+        val review = seededCommitReview("reopen-noop")
+        ReviewStateService.getInstance(project).addReview(review)
+        // addComment's own notifyChanged() is dispatched via invokeLater; run it on the EDT here so it is
+        // flushed before the listener below is registered, instead of racing in asynchronously afterwards.
+        ApplicationManager.getApplication().invokeAndWait {
+            manager.addComment(review.id, sampleChangedFile("src/Foo.kt"), DiffSide.RIGHT, 1, "todo")
+        }
+        val commentId = manager.findReview(review.id)!!.comments.single().id
+
+        var notifications = 0
+        val listener = { notifications += 1 }
+        manager.addListener(listener)
+        try {
+            assertThat(manager.markCommentOpen("missing")).isFalse()
+            assertThat(manager.markCommentOpen(commentId)).isFalse()
+        } finally {
+            manager.removeListener(listener)
+        }
+
+        assertThat(notifications).isZero()
+    }
+
+    @Test
     fun seenFileKeysReturnsEmptyForMissingReviewAndCurrentKeysForExistingReview() {
         val manager = ReviewManagerService.getInstance(project)
         val review = seededCommitReview("seen-keys")
@@ -676,7 +746,7 @@ class ReviewManagerServiceTest {
     }
 
     @Test
-    fun commentsForFileReturnsSortedOpenComments() {
+    fun commentsForFileReturnsSortedCommentsOfAllStatuses() {
         val manager = ReviewManagerService.getInstance(project)
         val review = seededCommitReview("comments-sorted")
         review.comments += ReviewComment(
@@ -713,7 +783,8 @@ class ReviewManagerServiceTest {
 
         val comments = manager.commentsForFile(review.id, "src/Foo.kt")
 
-        assertThat(comments.map { it.id }).containsExactly("c1", "c2")
+        // Sorted by anchor line regardless of status: resolved (line 1), c1 (line 2), c2 (line 5).
+        assertThat(comments.map { it.id }).containsExactly("resolved", "c1", "c2")
     }
 
     @Test
@@ -1020,6 +1091,100 @@ class ReviewManagerServiceTest {
 
         assertThat(comment.replies).hasSize(threadCount * repliesPerThread)
         assertThat(comment.replies.map { it.body }.toSet()).isEqualTo(expectedBodies)
+    }
+
+    @Test
+    fun resolvedCommentExpandStateDefaultsCollapsedAndRoundTrips() {
+        val manager = ReviewManagerService.getInstance(project)
+
+        assertThat(manager.isResolvedCommentExpanded("c-1")).isFalse()
+
+        manager.setResolvedCommentExpanded("c-1", true)
+        assertThat(manager.isResolvedCommentExpanded("c-1")).isTrue()
+        assertThat(manager.isResolvedCommentExpanded("c-2")).isFalse()
+
+        manager.setResolvedCommentExpanded("c-1", false)
+        assertThat(manager.isResolvedCommentExpanded("c-1")).isFalse()
+    }
+
+    @Test
+    fun settingExpandStateDoesNotNotifyListeners() {
+        val manager = ReviewManagerService.getInstance(project)
+        var notifications = 0
+        val listener = { notifications += 1 }
+        manager.addListener(listener)
+        try {
+            manager.setResolvedCommentExpanded("c-1", true)
+            manager.setResolvedCommentExpanded("c-1", false)
+        } finally {
+            manager.removeListener(listener)
+        }
+        assertThat(notifications).isZero()
+    }
+
+    @Test
+    fun statusTransitionResetsExpandState() {
+        val manager = ReviewManagerService.getInstance(project)
+        val review = seededCommitReview("expand-reset")
+        ReviewStateService.getInstance(project).addReview(review)
+        manager.addComment(review.id, sampleChangedFile("src/Foo.kt"), DiffSide.RIGHT, 1, "todo")
+        val commentId = manager.findReview(review.id)!!.comments.single().id
+        manager.markCommentResolved(commentId)
+
+        manager.setResolvedCommentExpanded(commentId, true)
+        assertThat(manager.markCommentOpen(commentId)).isTrue()
+        assertThat(manager.isResolvedCommentExpanded(commentId)).isFalse()
+
+        manager.setResolvedCommentExpanded(commentId, true)
+        assertThat(manager.markCommentResolved(commentId)).isTrue()
+        assertThat(manager.isResolvedCommentExpanded(commentId)).isFalse()
+    }
+
+    @Test
+    fun expandStateIsAlreadyResetWhenListenersAreNotified() {
+        // Guards the ordering inside setCommentStatus: the reset must happen BEFORE touch(),
+        // because on the EDT the listener rebuilds the UI synchronously and must see the reset.
+        val manager = ReviewManagerService.getInstance(project)
+        val review = seededCommitReview("expand-reset-ordering")
+        ReviewStateService.getInstance(project).addReview(review)
+        val commentId = ApplicationManager.getApplication().let { application ->
+            var id = ""
+            application.invokeAndWait {
+                manager.addComment(review.id, sampleChangedFile("src/Foo.kt"), DiffSide.RIGHT, 1, "todo")
+                id = manager.findReview(review.id)!!.comments.single().id
+                manager.markCommentResolved(id)
+            }
+            id
+        }
+        manager.setResolvedCommentExpanded(commentId, true)
+
+        val expandedSeenByListener = mutableListOf<Boolean>()
+        val listener = { expandedSeenByListener += manager.isResolvedCommentExpanded(commentId) }
+        manager.addListener(listener)
+        try {
+            ApplicationManager.getApplication().invokeAndWait {
+                assertThat(manager.markCommentOpen(commentId)).isTrue()
+            }
+        } finally {
+            manager.removeListener(listener)
+        }
+
+        assertThat(expandedSeenByListener).containsExactly(false)
+    }
+
+    @Test
+    fun noOpStatusCallPreservesExpandState() {
+        val manager = ReviewManagerService.getInstance(project)
+        val review = seededCommitReview("expand-preserve")
+        ReviewStateService.getInstance(project).addReview(review)
+        manager.addComment(review.id, sampleChangedFile("src/Foo.kt"), DiffSide.RIGHT, 1, "todo")
+        val commentId = manager.findReview(review.id)!!.comments.single().id
+        manager.markCommentResolved(commentId)
+        manager.setResolvedCommentExpanded(commentId, true)
+
+        assertThat(manager.markCommentResolved(commentId)).isFalse()
+
+        assertThat(manager.isResolvedCommentExpanded(commentId)).isTrue()
     }
 
     private fun seededReview(suffix: String): Review = Review(
