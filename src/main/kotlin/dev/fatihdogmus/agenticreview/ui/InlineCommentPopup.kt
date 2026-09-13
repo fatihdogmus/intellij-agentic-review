@@ -708,13 +708,17 @@ internal const val COLLAPSED_SUMMARY_BUDGET = 120
 
 /**
  * One-line summary of a comment body for the collapsed resolved row: whitespace runs (including
- * newlines) become single spaces, and the result never exceeds [COLLAPSED_SUMMARY_BUDGET] UTF-16
- * units in total, ellipsis included. Final pixel fitting is done by the rendering component, not here.
+ * newlines) become single spaces, and the result never exceeds the [budget], defaulting to
+ * [COLLAPSED_SUMMARY_BUDGET], UTF-16 units in total, ellipsis included. Final pixel fitting is done
+ * by the rendering component, not here.
+ *
+ * @throws IllegalArgumentException if [budget] is not positive.
  */
-internal fun collapsedSummaryText(body: String): String {
+internal fun collapsedSummaryText(body: String, budget: Int = COLLAPSED_SUMMARY_BUDGET): String {
+    require(budget > 0) { "budget must be positive, was $budget" }
     val normalized = body.trim().replace(Regex("\\s+"), " ")
-    return if (normalized.length <= COLLAPSED_SUMMARY_BUDGET) normalized
-    else normalized.take(COLLAPSED_SUMMARY_BUDGET - 1) + "…"
+    return if (normalized.length <= budget) normalized
+    else normalized.take(budget - 1) + "…"
 }
 
 private val REPLY_TIMESTAMP_FORMAT: DateTimeFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")

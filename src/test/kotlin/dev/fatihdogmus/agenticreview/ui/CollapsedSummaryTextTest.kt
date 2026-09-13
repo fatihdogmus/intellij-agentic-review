@@ -1,6 +1,7 @@
 package dev.fatihdogmus.agenticreview.ui
 
 import org.assertj.core.api.Assertions.assertThat
+import org.assertj.core.api.Assertions.assertThatThrownBy
 import org.junit.jupiter.api.Test
 
 class CollapsedSummaryTextTest {
@@ -41,5 +42,28 @@ class CollapsedSummaryTextTest {
     @Test
     fun budgetIs120Characters() {
         assertThat(COLLAPSED_SUMMARY_BUDGET).isEqualTo(120)
+    }
+
+    @Test
+    fun explicitBudgetOverridesDefault() {
+        val result = collapsedSummaryText("z".repeat(200), budget = 60)
+        assertThat(result).hasSize(60)
+        assertThat(result).endsWith("…")
+    }
+
+    @Test
+    fun defaultBudgetIsUnchangedWhenParameterOmitted() {
+        assertThat(collapsedSummaryText("z".repeat(200))).hasSize(COLLAPSED_SUMMARY_BUDGET)
+    }
+
+    @Test
+    fun nonPositiveBudgetThrows() {
+        assertThatThrownBy { collapsedSummaryText("anything", budget = 0) }
+            .isInstanceOf(IllegalArgumentException::class.java)
+            .hasMessageContaining("budget must be positive")
+
+        assertThatThrownBy { collapsedSummaryText("anything", budget = -1) }
+            .isInstanceOf(IllegalArgumentException::class.java)
+            .hasMessageContaining("budget must be positive")
     }
 }

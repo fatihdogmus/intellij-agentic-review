@@ -7,6 +7,7 @@ import com.intellij.diff.requests.SimpleDiffRequest
 import com.intellij.diff.util.DiffUserDataKeys
 import com.intellij.diff.util.Side
 import com.intellij.openapi.editor.Editor
+import com.intellij.openapi.editor.ex.EditorEx
 import com.intellij.openapi.vfs.LocalFileSystem
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.vcs.LocalFilePath
@@ -23,6 +24,7 @@ class DiffRequestBuilder(private val project: Project) {
         repositoryRoot: String,
         allowEditing: Boolean = false,
         onEditorsCreated: ((List<Editor>) -> Unit)? = null,
+        onCommentInlaysReady: ((EditorEx) -> Unit)? = null,
     ): DiffRequest {
         val beforeContent = createContent(
             changedFile.beforeContent,
@@ -56,6 +58,7 @@ class DiffRequestBuilder(private val project: Project) {
                     changedFile = changedFile,
                     commentSide = if (changedFile.afterContent != null) DiffSide.RIGHT else DiffSide.LEFT,
                     onEditorsCreated = onEditorsCreated,
+                    onCommentInlaysReady = onCommentInlaysReady,
                 ),
             )
         }

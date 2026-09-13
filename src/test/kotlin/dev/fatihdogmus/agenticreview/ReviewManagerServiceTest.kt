@@ -788,6 +788,36 @@ class ReviewManagerServiceTest {
     }
 
     @Test
+    fun commentsForFileSortsAnchorlessCommentsLast() {
+        val manager = ReviewManagerService.getInstance(project)
+        val review = seededCommitReview("comments-anchorless")
+        review.comments += ReviewComment(
+            id = "anchored",
+            reviewId = review.id,
+            filePath = "src/Foo.kt",
+            anchor = CommentAnchor(newLine = 1),
+            body = "anchored",
+            createdAt = "2026-05-07T14:19:00+03:00",
+            updatedAt = "2026-05-07T14:19:00+03:00",
+        )
+        review.comments += ReviewComment(
+            id = "anchorless",
+            reviewId = review.id,
+            filePath = "src/Foo.kt",
+            anchor = CommentAnchor(),
+            body = "anchorless",
+            createdAt = "2026-05-07T14:18:00+03:00",
+            updatedAt = "2026-05-07T14:18:00+03:00",
+        )
+        ReviewStateService.getInstance(project).addReview(review)
+
+        val comments = manager.commentsForFile(review.id, "src/Foo.kt")
+
+        // The anchorless comment was created first, yet sorts last: no anchor line always loses.
+        assertThat(comments.map { it.id }).containsExactly("anchored", "anchorless")
+    }
+
+    @Test
     fun ensureUncommittedReviewKeepsCurrentSelectionWhenAlreadySet() {
         val manager = ReviewManagerService.getInstance(project)
         val review = seededCommitReview("preserve-selection")

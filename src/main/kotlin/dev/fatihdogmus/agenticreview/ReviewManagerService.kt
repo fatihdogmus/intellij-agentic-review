@@ -444,7 +444,7 @@ class ReviewManagerService(private val project: Project) : Disposable {
             ?.comments
             ?.asSequence()
             ?.filter { it.filePath == filePath }
-            ?.sortedWith(compareBy({ it.anchor.newLine ?: it.anchor.oldLine ?: Int.MAX_VALUE }, { it.createdAt }))
+            ?.sortedWith(reviewCommentOrder)
             ?.toList()
             .orEmpty()
 
@@ -653,6 +653,14 @@ class ReviewManagerService(private val project: Project) : Disposable {
         fun getInstance(project: Project): ReviewManagerService = project.getService(ReviewManagerService::class.java)
     }
 }
+
+/**
+ * Canonical on-screen order for a file's comments: anchor line first, then creation time.
+ * Shared by [ReviewManagerService.commentsForFile] and the Changed Files tree so a comment's
+ * position in the tree matches the order its inlay appears in the diff.
+ */
+internal val reviewCommentOrder: Comparator<ReviewComment> =
+    compareBy({ it.anchor.newLine ?: it.anchor.oldLine ?: Int.MAX_VALUE }, { it.createdAt })
 
 private fun SavedReviewArchive.toReviewTarget(): ReviewTarget = when (targetType) {
     ReviewTargetType.COMMIT -> ReviewTarget(

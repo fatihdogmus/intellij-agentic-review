@@ -6,6 +6,7 @@ import com.intellij.diff.requests.ContentDiffRequest
 import com.intellij.diff.util.DiffUtil
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.application.runReadActionBlocking
+import com.intellij.openapi.editor.Editor
 import com.intellij.openapi.editor.ex.EditorEx
 import com.intellij.openapi.fileEditor.FileDocumentManager
 import com.intellij.openapi.editor.ex.util.LexerEditorHighlighter
@@ -16,7 +17,9 @@ import com.intellij.openapi.vfs.LocalFileSystem
 import com.intellij.psi.PsiDocumentManager
 import com.intellij.testFramework.junit5.TestApplication
 import com.intellij.testFramework.junit5.fixture.projectFixture
-import dev.fatihdogmus.agenticreview.model.DiffSide
+import dev.fatihdogmus.agenticreview.ReviewManagerService
+import dev.fatihdogmus.agenticreview.model.*
+import dev.fatihdogmus.agenticreview.persistence.ReviewStateService
 import dev.fatihdogmus.agenticreview.vcs.ChangedFile
 import dev.fatihdogmus.agenticreview.vcs.ChangedFileStatus
 import dev.fatihdogmus.agenticreview.vcs.ReviewContent
@@ -427,6 +430,64 @@ class DiffRequestBuilderIntegrationTest {
 
         assertThat(spellcheckStates).isNotEmpty
         assertThat(spellcheckStates).allMatch { it }
+    }
+
+    @Test
+    fun onCommentInlaysReadyFiresAfterInlaysExistAndOnlyOnCommentEditor() {
+        val manager = ReviewManagerService.getInstance(project)
+        val review = Review(
+            id = "review-order",
+            title = "order",
+            target = ReviewTarget(type = ReviewTargetType.COMMIT, commitHash = "abc"),
+            repositoryRoot = "/tmp/repo",
+            createdAt = "2026-09-12T10:00:00Z",
+            updatedAt = "2026-09-12T10:00:00Z",
+        )
+        ReviewStateService.getInstance(project).addReview(review)
+        val changedFile = ChangedFile(
+            filePath = "src/Order.kt",
+            status = ChangedFileStatus.MODIFIED,
+            beforeContent = ReviewContent("a\nb\nc\n", "HEAD", "src/Order.kt"),
+            afterContent = ReviewContent("a\nB\nc\n", "WORKTREE", "src/Order.kt"),
+        )
+        review.comments += ReviewComment(
+            id = "c-order", reviewId = review.id, filePath = "src/Order.kt",
+            anchor = CommentAnchor(newLine = 2), body = "here",
+            createdAt = "2026-09-12T10:00:00Z", updatedAt = "2026-09-12T10:00:00Z",
+        )
+
+        val latch = CountDownLatch(1)
+        var inlayCountAtCallback = -1
+        var markerPresentOnCallbackEditor = false
+        var markerPresentOnSibling = true
+        var editorsSeen: List<Editor> = emptyList()
+
+        val request = DiffRequestBuilder(project).buildForFile(
+            review.id, changedFile, "/tmp/repo",
+            onEditorsCreated = { editorsSeen = it },
+            onCommentInlaysReady = { editor ->
+                inlayCountAtCallback = editor.inlayModel.getBlockElementsInRange(0, editor.document.textLength).size
+                markerPresentOnCallbackEditor = editor.getUserData(REVIEW_DIFF_COMMENT_EDITOR_KEY) != null
+                markerPresentOnSibling = editorsSeen.filter { it !== editor }
+                    .any { it.getUserData(REVIEW_DIFF_COMMENT_EDITOR_KEY) != null }
+                latch.countDown()
+            },
+        )
+
+        ApplicationManager.getApplication().invokeAndWait {
+            val disposable = Disposer.newDisposable()
+            try {
+                val panel = DiffManager.getInstance().createRequestPanel(project, disposable, null)
+                panel.setRequest(request)
+                assertThat(latch.await(5, TimeUnit.SECONDS)).isTrue()
+            } finally {
+                Disposer.dispose(disposable)
+            }
+        }
+
+        assertThat(inlayCountAtCallback).isGreaterThanOrEqualTo(1)
+        assertThat(markerPresentOnCallbackEditor).isTrue()
+        assertThat(markerPresentOnSibling).isFalse()
     }
 
     private fun createHighlighter(content: DocumentContent) = runReadActionBlocking {

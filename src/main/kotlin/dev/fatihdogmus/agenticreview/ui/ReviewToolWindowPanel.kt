@@ -10,12 +10,16 @@ import com.intellij.openapi.Disposable
 import com.intellij.openapi.actionSystem.ActionPlaces
 import com.intellij.openapi.actionSystem.AnActionEvent
 import com.intellij.openapi.actionSystem.DefaultActionGroup
+import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.fileChooser.FileChooser
 import com.intellij.openapi.fileChooser.FileChooserDescriptorFactory
 import com.intellij.openapi.progress.ProgressIndicator
 import com.intellij.openapi.progress.Task
 import com.intellij.openapi.project.DumbAwareAction
 import com.intellij.openapi.editor.Editor
+import com.intellij.openapi.editor.LogicalPosition
+import com.intellij.openapi.editor.ScrollType
+import com.intellij.openapi.editor.ex.EditorEx
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.ui.Messages
 import com.intellij.openapi.ui.SimpleToolWindowPanel
@@ -30,7 +34,9 @@ import dev.fatihdogmus.agenticreview.ReviewFileNavigator
 import dev.fatihdogmus.agenticreview.ReviewManagerService
 import dev.fatihdogmus.agenticreview.VcsLogReviewSupport
 import dev.fatihdogmus.agenticreview.diff.DiffRequestBuilder
+import dev.fatihdogmus.agenticreview.diff.REVIEW_DIFF_COMMENT_EDITOR_KEY
 import dev.fatihdogmus.agenticreview.diff.ReviewDiffPanel
+import dev.fatihdogmus.agenticreview.diff.ReviewDiffRequestData
 import dev.fatihdogmus.agenticreview.editor.ReviewPageManager
 import dev.fatihdogmus.agenticreview.export.ExportUiSupport
 import dev.fatihdogmus.agenticreview.model.Review
@@ -55,7 +61,7 @@ class ReviewToolWindowPanel(
 
     val embeddedEditors: List<Editor>
         get() = diffPanel.embeddedEditors
-    private val changedFilesPanel = ChangedFilesPanel()
+    private val changedFilesPanel = ChangedFilesPanel(project)
     private val contentPanel = JPanel(BorderLayout())
     private val reviewSelector = JComboBox<Review>()
     private val createReviewButton = RoundedToolbarButton("Create Review")
@@ -63,10 +69,19 @@ class ReviewToolWindowPanel(
     private val reviewSelectorPanel = createReviewSelectorPanel()
     private val mainContent = createMainContent()
     private var updatingReviewSelector = false
+
+    private data class PendingCommentNavigation(
+        val reviewId: String,
+        val commentId: String,
+        val filePath: String,
+    )
+
+    private var pendingCommentNavigation: PendingCommentNavigation? = null
     private val stateListener: () -> Unit = {
         // Comment inlays are attached when a diff viewer is created, so comment mutations
         // must invalidate cached requests to force the viewer to rebuild immediately.
         diffRequestCache.clear()
+        if (pendingCommentNavigation?.reviewId != manager.currentReviewId) pendingCommentNavigation = null
         refreshUi()
     }
     private val turnStateListener: () -> Unit = { refreshUi() }
@@ -96,6 +111,7 @@ class ReviewToolWindowPanel(
         editReviewButton.applyToolbarDropdownStyle().addActionListener { showEditReviewMenu() }
 
         changedFilesPanel.onSelectionChanged = { changedFile ->
+            pendingCommentNavigation = null
             manager.selectFile(changedFile?.filePath)
             refreshDiff()
         }
@@ -106,7 +122,15 @@ class ReviewToolWindowPanel(
             deleteChangedFile(changedFile)
         }
         changedFilesPanel.onTurnChanged = { turn ->
+            pendingCommentNavigation = null
             refreshDiffForTurn(turn)
+        }
+        changedFilesPanel.onCommentSelected = { comment ->
+            val reviewId = manager.currentReviewId
+            if (reviewId != null) {
+                pendingCommentNavigation = PendingCommentNavigation(reviewId, comment.id, comment.filePath)
+                scrollDisplayedEditorToPendingComment()
+            }
         }
 
         refreshUi()
@@ -116,8 +140,48 @@ class ReviewToolWindowPanel(
         get() = changedFilesPanel.component
 
     override fun dispose() {
+        pendingCommentNavigation = null
         manager.removeListener(stateListener)
         turnSnapshotService.removeListener(turnStateListener)
+    }
+
+    /**
+     * Fallback path: matches any currently displayed editor carrying REVIEW_DIFF_COMMENT_EDITOR_KEY,
+     * whether it was already on screen or was just built (in which case onCommentInlaysReady would
+     * also fire, but this path catches the navigation regardless).
+     */
+    private fun scrollDisplayedEditorToPendingComment() {
+        // Design §5 states navigation is EDT-confined, which is why the pending record needs no
+        // synchronisation. Assert it rather than assuming it.
+        ApplicationManager.getApplication().assertIsDispatchThread()
+        val pending = pendingCommentNavigation ?: return
+        val editor = diffPanel.embeddedEditors
+            .filterIsInstance<EditorEx>()
+            .firstOrNull { it.getUserData(REVIEW_DIFF_COMMENT_EDITOR_KEY)?.matches(pending) == true }
+            ?: return
+        consumePendingNavigation(editor)
+    }
+
+    /** Callback path: a new viewer was built and its inlays now exist. */
+    private fun onCommentInlaysReady(editor: EditorEx) {
+        ApplicationManager.getApplication().assertIsDispatchThread()
+        val pending = pendingCommentNavigation ?: return
+        if (editor.getUserData(REVIEW_DIFF_COMMENT_EDITOR_KEY)?.matches(pending) != true) return
+        consumePendingNavigation(editor)
+    }
+
+    private fun ReviewDiffRequestData.matches(pending: PendingCommentNavigation): Boolean =
+        reviewId == pending.reviewId && changedFile.filePath == pending.filePath
+
+    private fun consumePendingNavigation(editor: EditorEx) {
+        val pending = pendingCommentNavigation ?: return
+        if (pending.reviewId != manager.currentReviewId) { pendingCommentNavigation = null; return }
+        val comment = manager.findCommentWithReview(pending.commentId)?.second
+        pendingCommentNavigation = null
+        if (comment == null) return
+        val line = (comment.anchor.newLine ?: comment.anchor.oldLine)?.minus(1) ?: return
+        val safeLine = line.coerceIn(0, (editor.document.lineCount - 1).coerceAtLeast(0))
+        editor.scrollingModel.scrollTo(LogicalPosition(safeLine, 0), ScrollType.CENTER)
     }
 
     private fun refreshUi() {
@@ -128,11 +192,11 @@ class ReviewToolWindowPanel(
 
         if (review != null) {
             val files = changedFilesByReviewId[review.id].orEmpty()
-            changedFilesPanel.setReviewFiles(files, manager.currentFilePath, manager.seenFileKeys(review.id))
+            changedFilesPanel.setReviewFiles(files, manager.currentFilePath, manager.seenFileKeys(review.id), review.comments)
             loadChangedFilesIfNeeded(review)
             refreshDiff()
         } else {
-            changedFilesPanel.setReviewFiles(emptyList(), null, emptySet())
+            changedFilesPanel.setReviewFiles(emptyList(), null, emptySet(), emptyList())
             diffPanel.showDiff(MessageDiffRequest("Select review from dropdown above."))
         }
         contentPanel.revalidate()
@@ -175,6 +239,7 @@ class ReviewToolWindowPanel(
                             diffPanel.setEmbeddedEditors(editors)
                             seedEmbeddedEditorContexts(editors)
                         },
+                        onCommentInlaysReady = ::onCommentInlaysReady,
                     )
                 } catch (e: Exception) {
                     return@getOrPut MessageDiffRequest("Failed to build diff request: ${e.message}")
@@ -186,6 +251,7 @@ class ReviewToolWindowPanel(
                     changedFilesByReviewId[reviewId].orEmpty(),
                     manager.currentFilePath,
                     manager.seenFileKeys(reviewId),
+                    review?.comments.orEmpty(),
                 )
             }
         }
@@ -309,7 +375,8 @@ class ReviewToolWindowPanel(
                     changedFilesPanel.setReviewFiles(
                         changedFiles,
                         manager.currentFilePath,
-                        manager.seenFileKeys(review.id)
+                        manager.seenFileKeys(review.id),
+                        review.comments,
                     )
                     refreshDiff()
                 }

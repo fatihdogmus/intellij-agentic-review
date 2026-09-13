@@ -1,5 +1,6 @@
 package dev.fatihdogmus.agenticreview.testutil
 
+import com.intellij.ui.treeStructure.Tree
 import dev.fatihdogmus.agenticreview.ui.ChangedFilesPanel
 import dev.fatihdogmus.agenticreview.ui.ReviewToolWindowPanel
 import java.awt.Component
@@ -28,8 +29,8 @@ fun findLabel(component: Component, text: String): JLabel? {
 
 fun labels(component: Component): List<JLabel> = findComponents(component).filterIsInstance<JLabel>()
 
-fun reviewTree(panel: ChangedFilesPanel): JTree =
-    findComponents(panel.component).filterIsInstance<JTree>().single()
+fun reviewTree(panel: ChangedFilesPanel): Tree =
+    findComponents(panel.component).filterIsInstance<Tree>().single()
 
 fun turnCombo(panel: ChangedFilesPanel): JComboBox<*> =
     findComponents(panel.component)
