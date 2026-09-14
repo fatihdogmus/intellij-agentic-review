@@ -132,6 +132,40 @@ class ReviewMcpToolset : McpToolset {
         )
     }
 
+    @McpTool(name = "review_reply_to_comment")
+    @McpDescription("Reply to a review comment without changing its status. Use to ask a clarifying question or push back before resolving. The returned replyCount counts stored replies only, not the projected replies array returned by other read tools.")
+    suspend fun reviewReplyToComment(
+        @McpDescription("Comment id")
+        commentId: String,
+        @McpDescription("Reply text")
+        body: String,
+        @McpDescription("Agent name. Defaults to MCP client name when available")
+        agentName: String? = null,
+        @McpDescription("Optional agent run id")
+        runId: String? = null,
+    ): String {
+        if (body.isBlank()) mcpFail("Reply body must not be blank")
+        val manager = manager()
+        val (_, comment) = manager.findCommentWithReview(commentId)
+            ?: mcpFail("Comment not found: $commentId")
+        val reply = manager.addReply(
+            commentId = commentId,
+            body = body,
+            author = agentName?.takeIf { it.isNotBlank() } ?: defaultAgentName(),
+            authorKind = ReplyAuthorKind.AGENT,
+            kind = ReplyKind.COMMENT,
+            runId = runId,
+        ) ?: mcpFail("Failed to add reply to comment: $commentId")
+        return json.encodeToString(
+            ReplyMutationResult(
+                ok = true,
+                commentId = commentId,
+                replyId = reply.id,
+                replyCount = comment.replies.size,
+            ),
+        )
+    }
+
     @McpTool(name = "review_export")
     @McpDescription("Export one review as JSON or Markdown for agent consumption.")
     suspend fun reviewExport(
@@ -354,6 +388,17 @@ class ReviewMcpToolset : McpToolset {
             updatedAt = comment.updatedAt,
             author = comment.author,
             agentMetadata = comment.agentMetadata,
+            replies = comment.thread().map { reply ->
+                CommentReplyPayload(
+                    id = reply.id,
+                    author = reply.author,
+                    authorKind = reply.authorKind,
+                    kind = reply.kind,
+                    body = reply.body,
+                    createdAt = reply.createdAt,
+                    runId = reply.runId,
+                )
+            },
         )
     }
 
@@ -427,6 +472,7 @@ data class CommentSummary(
     val updatedAt: String,
     val author: String?,
     val agentMetadata: AgentMetadata?,
+    val replies: List<CommentReplyPayload> = emptyList(),
 )
 
 @Serializable
@@ -470,4 +516,23 @@ data class MutationResult(
 data class ExportResult(
     val format: String,
     val content: String,
+)
+
+@Serializable
+data class CommentReplyPayload(
+    val id: String,
+    val author: String,
+    val authorKind: ReplyAuthorKind,
+    val kind: ReplyKind,
+    val body: String,
+    val createdAt: String,
+    val runId: String? = null,
+)
+
+@Serializable
+data class ReplyMutationResult(
+    val ok: Boolean,
+    val commentId: String,
+    val replyId: String,
+    val replyCount: Int,
 )

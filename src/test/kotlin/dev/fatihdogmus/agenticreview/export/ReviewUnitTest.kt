@@ -201,6 +201,85 @@ class ReviewUnitTest {
         assertThat(empty.afterContext).isEmpty()
     }
 
+    @Test
+    fun promptBuilderIncludesReplyThread() {
+        val comment = sampleReview().comments.first().apply {
+            replies = mutableListOf(
+                CommentReply(
+                    id = "reply-1",
+                    commentId = id,
+                    author = "codex",
+                    authorKind = ReplyAuthorKind.AGENT,
+                    body = "which call site did you mean?",
+                    createdAt = "2026-09-01T09:00:00+03:00",
+                ),
+                CommentReply(
+                    id = "reply-2",
+                    commentId = id,
+                    author = "you",
+                    body = "the second one",
+                    createdAt = "2026-09-01T09:05:00+03:00",
+                ),
+            )
+        }
+        val review = sampleReview().copy(comments = mutableListOf(comment))
+
+        val exported = AgentPromptBuilder().build(review)
+
+        assertThat(exported)
+            .contains("- Thread:")
+            .contains("**codex**")
+            .contains("which call site did you mean?")
+            .contains("**you**")
+            .contains("the second one")
+    }
+
+    @Test
+    fun promptBuilderRendersLegacyAgentMetadataThreadWhenNoStoredReplies() {
+        val comment = sampleReview().comments.first().apply {
+            agentMetadata = AgentMetadata(
+                addressedBy = "codex",
+                addressedAt = "2026-09-01T09:00:00+03:00",
+                message = "handled previously",
+            )
+        }
+        val review = sampleReview().copy(comments = mutableListOf(comment))
+
+        val exported = AgentPromptBuilder().build(review)
+
+        assertThat(exported)
+            .contains("- Thread:")
+            .contains("**codex**")
+            .contains("handled previously")
+    }
+
+    @Test
+    fun promptBuilderOmitsThreadSectionWhenNoReplies() {
+        assertThat(AgentPromptBuilder().build(sampleReview())).doesNotContain("- Thread:")
+    }
+
+    @Test
+    fun promptBuilderIndentsMultilineReplyBodies() {
+        val comment = sampleReview().comments.first().apply {
+            replies = mutableListOf(
+                CommentReply(
+                    id = "reply-1",
+                    commentId = id,
+                    author = "codex",
+                    body = "first line\nsecond line",
+                    createdAt = "2026-09-01T09:00:00+03:00",
+                ),
+            )
+        }
+        val review = sampleReview().copy(comments = mutableListOf(comment))
+
+        val exported = AgentPromptBuilder().build(review)
+
+        assertThat(exported)
+            .contains("  - **codex** (2026-09-01T09:00:00+03:00): first line")
+            .contains("\n    second line")
+    }
+
     private fun sampleReview(): Review = Review(
         id = "review-unit-1",
         title = "Review abc123",

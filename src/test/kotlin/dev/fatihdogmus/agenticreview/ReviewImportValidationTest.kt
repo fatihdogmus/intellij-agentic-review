@@ -155,6 +155,114 @@ class ReviewImportValidationTest {
         assertThat(review.comments.single().reviewId).isEqualTo(review.id)
     }
 
+    @Test
+    fun loadReviewFromFileReturnsGenericMalformedErrorForBlankReplyBody() {
+        val manager = configuredManager()
+        val brokenComment = sampleComment().copy(
+            replies = mutableListOf(
+                CommentReply(
+                    id = "reply-1",
+                    commentId = "comment-1",
+                    author = "codex",
+                    body = "   ",
+                    createdAt = "2026-09-01T09:00:00+03:00",
+                ),
+            ),
+        )
+        val file = writeArchive(
+            archive = validCommitArchive().copy(comments = listOf(brokenComment)),
+            fileName = "blank-reply-body.json",
+        )
+
+        val result = manager.loadReviewFromFile(file)
+
+        assertThat(result.ok).isFalse()
+        assertThat(result.error).isEqualTo("The imported format is malformed")
+    }
+
+    @Test
+    fun loadReviewFromFileReturnsGenericMalformedErrorForBlankReplyId() {
+        val manager = configuredManager()
+        val brokenComment = sampleComment().copy(
+            replies = mutableListOf(
+                CommentReply(
+                    id = "   ",
+                    commentId = "comment-1",
+                    author = "codex",
+                    body = "fixed upstream",
+                    createdAt = "2026-09-01T09:00:00+03:00",
+                ),
+            ),
+        )
+        val file = writeArchive(
+            archive = validCommitArchive().copy(comments = listOf(brokenComment)),
+            fileName = "blank-reply-id.json",
+        )
+
+        val result = manager.loadReviewFromFile(file)
+
+        assertThat(result.ok).isFalse()
+        assertThat(result.error).isEqualTo("The imported format is malformed")
+    }
+
+    @Test
+    fun loadReviewFromFileReturnsGenericMalformedErrorForBlankReplyCreatedAt() {
+        val manager = configuredManager()
+        val brokenComment = sampleComment().copy(
+            replies = mutableListOf(
+                CommentReply(
+                    id = "reply-1",
+                    commentId = "comment-1",
+                    author = "codex",
+                    body = "fixed upstream",
+                    createdAt = "   ",
+                ),
+            ),
+        )
+        val file = writeArchive(
+            archive = validCommitArchive().copy(comments = listOf(brokenComment)),
+            fileName = "blank-reply-created-at.json",
+        )
+
+        val result = manager.loadReviewFromFile(file)
+
+        assertThat(result.ok).isFalse()
+        assertThat(result.error).isEqualTo("The imported format is malformed")
+    }
+
+    @Test
+    fun loadReviewFromFileRekeysRepliesToImportedCommentId() {
+        val manager = configuredManager()
+        val comment = sampleComment().copy(
+            replies = mutableListOf(
+                CommentReply(
+                    id = "reply-1",
+                    commentId = "comment-1",
+                    author = "codex",
+                    authorKind = ReplyAuthorKind.AGENT,
+                    kind = ReplyKind.RESOLUTION,
+                    body = "fixed upstream",
+                    createdAt = "2026-09-01T09:00:00+03:00",
+                ),
+            ),
+        )
+        val file = writeArchive(
+            archive = validCommitArchive().copy(comments = listOf(comment)),
+            fileName = "rekey-replies.json",
+        )
+
+        val result = manager.loadReviewFromFile(file)
+
+        assertThat(result.ok).isTrue()
+        val imported = manager.findReview(result.reviewId!!)!!.comments.single()
+        assertThat(imported.id).isNotEqualTo("comment-1")
+        val reply = imported.replies.single()
+        assertThat(reply.commentId).isEqualTo(imported.id)
+        assertThat(reply.body).isEqualTo("fixed upstream")
+        assertThat(reply.authorKind).isEqualTo(ReplyAuthorKind.AGENT)
+        assertThat(reply.kind).isEqualTo(ReplyKind.RESOLUTION)
+    }
+
     private fun configuredManager(): ReviewManagerService = ReviewManagerService.getInstance(project).also { manager ->
         val tempDir = Files.createTempDirectory("agentic-review-import-tests")
         manager.repositoryRootResolver = { tempDir.toString() }
