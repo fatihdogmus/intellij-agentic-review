@@ -150,10 +150,10 @@ Supported comment statuses:
 - `OPEN`
 - `RESOLVED`
 
-Current UI behavior emphasizes open work:
-- active review surfaces show open comments only
+Current UI behavior:
+- active review surfaces show resolved comments as a collapsed row, expandable to the full body and reply thread
 - review lists still show open/resolved counts
-- agents or humans can mark comments `RESOLVED`
+- agents or humans can mark comments `RESOLVED`; only humans can reopen a resolved comment
 
 ### Save and load
 

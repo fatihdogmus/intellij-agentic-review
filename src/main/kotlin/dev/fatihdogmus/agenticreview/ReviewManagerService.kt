@@ -27,6 +27,7 @@ import org.valiktor.validate
 import java.nio.file.Files
 import java.nio.file.Path
 import java.util.*
+import java.util.concurrent.ConcurrentHashMap
 
 @Service(Service.Level.PROJECT)
 class ReviewManagerService(private val project: Project) : Disposable {
@@ -34,6 +35,14 @@ class ReviewManagerService(private val project: Project) : Disposable {
     private val turnSnapshotService = TurnSnapshotService.getInstance(project)
     private val diffContextExtractor = DiffContextExtractor()
     private val listeners = mutableSetOf<() -> Unit>()
+
+    /**
+     * Ids of resolved comments the user has expanded in this project session. View state only:
+     * never serialized, never notifies listeners. Thread-safe because [setCommentStatus] mutates it
+     * and is reached from MCP coroutine threads without EDT marshalling. Note that any real status
+     * transition (via [setCommentStatus]) silently clears the comment's id from this set.
+     */
+    private val expandedResolvedComments: MutableSet<String> = ConcurrentHashMap.newKeySet()
     private val archiveJson = Json { prettyPrint = true; encodeDefaults = true; ignoreUnknownKeys = true }
     internal var uncommittedChangesLoader: () -> List<ChangedFile> =
         { UncommittedChangesProvider(project).getChangedFiles() }
@@ -247,7 +256,14 @@ class ReviewManagerService(private val project: Project) : Disposable {
             updatedAt = archive.updatedAt.ifBlank { now },
             status = archive.reviewStatus,
             comments = archive.comments.map { comment ->
-                comment.copy(id = UUID.randomUUID().toString(), reviewId = reviewId)
+                val newCommentId = UUID.randomUUID().toString()
+                comment.copy(
+                    id = newCommentId,
+                    reviewId = reviewId,
+                    replies = comment.replies
+                        .map { it.copy(commentId = newCommentId) }
+                        .toMutableList(),
+                )
             }.toMutableList(),
         )
         stateService.addReview(review)
@@ -325,12 +341,66 @@ class ReviewManagerService(private val project: Project) : Disposable {
     fun deleteComment(commentId: String): Boolean {
         val (review, comment) = findComment(commentId) ?: return false
         if (review.comments.remove(comment)) {
+            expandedResolvedComments.remove(commentId)
             touch(review)
             return true
         }
         return false
     }
 
+    fun addReply(
+        commentId: String,
+        body: String,
+        author: String? = null,
+        authorKind: ReplyAuthorKind = ReplyAuthorKind.HUMAN,
+        kind: ReplyKind = ReplyKind.COMMENT,
+        runId: String? = null,
+    ): CommentReply? {
+        val application = ApplicationManager.getApplication()
+        if (application.isDispatchThread) {
+            return addReplyOnEdt(commentId, body, author, authorKind, kind, runId)
+        }
+        var result: CommentReply? = null
+        application.invokeAndWait {
+            result = addReplyOnEdt(commentId, body, author, authorKind, kind, runId)
+        }
+        return result
+    }
+
+    private fun addReplyOnEdt(
+        commentId: String,
+        body: String,
+        author: String?,
+        authorKind: ReplyAuthorKind,
+        kind: ReplyKind,
+        runId: String?,
+    ): CommentReply? {
+        val trimmedBody = body.trim()
+        if (trimmedBody.isEmpty()) return null
+        val (review, comment) = findComment(commentId) ?: return null
+        val reply = CommentReply(
+            id = UUID.randomUUID().toString(),
+            commentId = commentId,
+            author = author?.takeIf { it.isNotBlank() }
+                ?: if (authorKind == ReplyAuthorKind.AGENT) "agent" else humanAuthor(),
+            authorKind = authorKind,
+            kind = kind,
+            body = trimmedBody,
+            createdAt = nowIso(),
+            runId = runId,
+        )
+        comment.replies.add(reply)
+        comment.updatedAt = nowIso()
+        touch(review)
+        return reply
+    }
+
+    /**
+     * Returns `true` only if this call transitioned the comment's status to [CommentStatus.RESOLVED].
+     * Returns `false` for a comment already RESOLVED (or missing) — but in the already-RESOLVED case,
+     * [agentMetadata][ReviewComment.agentMetadata] is still overwritten and a RESOLUTION reply may still
+     * be appended before that no-op check is reached, so `false` does not mean the call had no effect.
+     */
     fun markCommentResolved(
         commentId: String,
         message: String? = null,
@@ -338,25 +408,43 @@ class ReviewManagerService(private val project: Project) : Disposable {
         runId: String? = null
     ): Boolean {
         val (_, comment) = findComment(commentId) ?: return false
-        comment.agentMetadata = if (message != null || agentName != null || runId != null) {
-            AgentMetadata(
+        if (message != null || agentName != null || runId != null) {
+            comment.agentMetadata = AgentMetadata(
                 addressedBy = agentName,
                 addressedAt = nowIso(),
-                message = message,
+                message = null,
                 runId = runId,
             )
-        } else {
-            comment.agentMetadata
+        }
+        if (!message.isNullOrBlank()) {
+            addReply(
+                commentId = commentId,
+                body = message,
+                author = agentName,
+                authorKind = ReplyAuthorKind.AGENT,
+                kind = ReplyKind.RESOLUTION,
+                runId = runId,
+            )
         }
         return setCommentStatus(commentId, CommentStatus.RESOLVED)
     }
 
+    /** Human-only reopen. Leaves [ReviewComment.replies] and [ReviewComment.agentMetadata] intact as history. */
+    fun markCommentOpen(commentId: String): Boolean = setCommentStatus(commentId, CommentStatus.OPEN)
+
+    fun isResolvedCommentExpanded(commentId: String): Boolean = commentId in expandedResolvedComments
+
+    fun setResolvedCommentExpanded(commentId: String, expanded: Boolean) {
+        if (expanded) expandedResolvedComments.add(commentId) else expandedResolvedComments.remove(commentId)
+    }
+
+    /** Returns every comment on [filePath], regardless of status, ordered by anchor line then creation time. */
     fun commentsForFile(reviewId: String, filePath: String): List<ReviewComment> =
         findReview(reviewId)
             ?.comments
             ?.asSequence()
-            ?.filter { it.filePath == filePath && it.status == CommentStatus.OPEN }
-            ?.sortedWith(compareBy({ it.anchor.newLine ?: it.anchor.oldLine ?: Int.MAX_VALUE }, { it.createdAt }))
+            ?.filter { it.filePath == filePath }
+            ?.sortedWith(reviewCommentOrder)
             ?.toList()
             .orEmpty()
 
@@ -421,8 +509,10 @@ class ReviewManagerService(private val project: Project) : Disposable {
 
     private fun setCommentStatus(commentId: String, status: CommentStatus): Boolean {
         val (review, comment) = findComment(commentId) ?: return false
+        if (comment.status == status) return false
         comment.status = status
         comment.updatedAt = nowIso()
+        expandedResolvedComments.remove(commentId)
         touch(review)
         return true
     }
@@ -522,6 +612,22 @@ class ReviewManagerService(private val project: Project) : Disposable {
         return null
     }
 
+    private var cachedHumanAuthor: String? = null
+
+    private fun humanAuthor(): String {
+        cachedHumanAuthor?.let { return it }
+        val resolved = runCatching {
+            GitCommandFallback(repositoryRootResolver())
+                .runOrNull("config", "user.name")
+                ?.trim()
+                ?.takeIf { it.isNotEmpty() }
+        }.getOrNull()
+            ?: System.getProperty("user.name")?.takeIf { it.isNotBlank() }
+            ?: "you"
+        cachedHumanAuthor = resolved
+        return resolved
+    }
+
     private fun touch(review: Review) {
         review.updatedAt = nowIso()
         notifyChanged()
@@ -547,6 +653,14 @@ class ReviewManagerService(private val project: Project) : Disposable {
         fun getInstance(project: Project): ReviewManagerService = project.getService(ReviewManagerService::class.java)
     }
 }
+
+/**
+ * Canonical on-screen order for a file's comments: anchor line first, then creation time.
+ * Shared by [ReviewManagerService.commentsForFile] and the Changed Files tree so a comment's
+ * position in the tree matches the order its inlay appears in the diff.
+ */
+internal val reviewCommentOrder: Comparator<ReviewComment> =
+    compareBy({ it.anchor.newLine ?: it.anchor.oldLine ?: Int.MAX_VALUE }, { it.createdAt })
 
 private fun SavedReviewArchive.toReviewTarget(): ReviewTarget = when (targetType) {
     ReviewTargetType.COMMIT -> ReviewTarget(
@@ -593,6 +707,13 @@ private fun SavedReviewArchive.validatedForImport(): SavedReviewArchive {
             validate(ReviewComment::body).isNotBlank()
             validate(ReviewComment::createdAt).isNotBlank()
             validate(ReviewComment::updatedAt).isNotBlank()
+        }
+        comment.replies.forEach { reply ->
+            validate(reply) {
+                validate(CommentReply::id).isNotBlank()
+                validate(CommentReply::body).isNotBlank()
+                validate(CommentReply::createdAt).isNotBlank()
+            }
         }
     }
     when (targetType) {

@@ -35,6 +35,9 @@ import javax.swing.SwingUtilities
 
 val REVIEW_DIFF_EDITOR_KEY = Key.create<ReviewDiffRequestData>("local.review.diff.editor.data")
 
+/** Present only on the editor that hosts review-comment inlays; absent on its two-sided sibling. */
+val REVIEW_DIFF_COMMENT_EDITOR_KEY = Key.create<ReviewDiffRequestData>("local.review.diff.comment.editor.data")
+
 private val GREEN = JBColor(Color(0x2E, 0xA4, 0x4F), Color(0x4F, 0xC7, 0x70))
 private val HOVER_BG = JBColor(Color(0x2E, 0xA4, 0x4F, 18), Color(0x4F, 0xC7, 0x70, 28))
 private const val ICON_SIZE = 16
@@ -61,6 +64,7 @@ class ReviewDiffExtension : DiffExtension() {
         }
 
         commentEditor.putUserData(REVIEW_DIFF_EDITOR_KEY, requestData)
+        commentEditor.putUserData(REVIEW_DIFF_COMMENT_EDITOR_KEY, requestData)
 
         val allEditors = when (viewer) {
             is TwosideTextDiffViewer -> listOf(viewer.editor1, viewer.editor2)
@@ -94,6 +98,10 @@ class ReviewDiffExtension : DiffExtension() {
                 renderer.dispose()
             }
         })
+
+        // Invoked after the dispose listener is registered above, so a throwing callback cannot leak
+        // the inlays created by showReviewCommentInlays without their disposal being wired up.
+        requestData.onCommentInlaysReady?.invoke(commentEditor)
     }
 }
 
