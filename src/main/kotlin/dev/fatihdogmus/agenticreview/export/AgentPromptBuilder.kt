@@ -4,6 +4,7 @@ import dev.fatihdogmus.agenticreview.model.CommentAnchor
 import dev.fatihdogmus.agenticreview.model.CommentStatus
 import dev.fatihdogmus.agenticreview.model.Review
 import dev.fatihdogmus.agenticreview.model.ReviewComment
+import dev.fatihdogmus.agenticreview.model.thread
 
 class AgentPromptBuilder {
     fun build(review: Review): String = buildString {
@@ -54,6 +55,16 @@ class AgentPromptBuilder {
         appendLine("- Lines: ${comment.anchor.lineLabel()}")
         appendLine("- Comment:")
         appendLine(comment.body)
+        val thread = comment.thread()
+        if (thread.isNotEmpty()) {
+            appendLine()
+            appendLine("- Thread:")
+            thread.forEach { reply ->
+                val lines = reply.body.lines()
+                appendLine("  - **${reply.author}** (${reply.createdAt}): ${lines.first()}")
+                lines.drop(1).forEach { appendLine("    $it") }
+            }
+        }
         appendLine()
     }
 }

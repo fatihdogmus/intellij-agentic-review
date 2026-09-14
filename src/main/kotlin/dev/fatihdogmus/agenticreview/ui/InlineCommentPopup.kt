@@ -18,9 +18,15 @@ import com.intellij.util.IconUtil
 import com.intellij.util.ui.JBUI
 import dev.fatihdogmus.agenticreview.ReviewManagerService
 import dev.fatihdogmus.agenticreview.diff.ReviewDiffRequestData
+import dev.fatihdogmus.agenticreview.model.CommentReply
+import dev.fatihdogmus.agenticreview.model.ReplyKind
 import dev.fatihdogmus.agenticreview.model.ReviewComment
+import dev.fatihdogmus.agenticreview.model.thread
 import java.awt.*
 import java.awt.event.*
+import java.time.LocalDateTime
+import java.time.OffsetDateTime
+import java.time.format.DateTimeFormatter
 import javax.swing.*
 import javax.swing.border.AbstractBorder
 
@@ -234,8 +240,8 @@ private fun showExistingCommentInlay(
 }
 
 private class ExistingCommentPanel(
-    project: Project,
-    editor: EditorEx,
+    private val project: Project,
+    private val editor: EditorEx,
     private val comment: ReviewComment,
 ) : JPanel(BorderLayout(0, 6)) {
 
@@ -245,6 +251,19 @@ private class ExistingCommentPanel(
     private val menuButton: JButton
     private val body: JBTextArea
     private val editActionsPanel: JPanel
+    private val repliesPanel = JPanel().apply {
+        isOpaque = false
+        layout = BoxLayout(this, BoxLayout.Y_AXIS)
+        alignmentX = LEFT_ALIGNMENT
+    }
+    private val replyTextArea = JBTextArea(2, 40).apply {
+        lineWrap = true
+        wrapStyleWord = true
+        border = JBUI.Borders.empty(8, 10)
+        background = INPUT_BG
+    }
+    private lateinit var replyFormPanel: JPanel
+    private lateinit var replyActionsPanel: JPanel
 
     init {
         isOpaque = false
@@ -354,15 +373,97 @@ private class ExistingCommentPanel(
             add(saveButton)
         }
 
+        val postReplyButton = JButton("Post reply").apply {
+            applyCommentActionStyle(primary = true)
+            addActionListener { submitReply() }
+        }
+        installSubmitShortcut(replyTextArea) { postReplyButton.doClick() }
+        val cancelReplyButton = JButton("Cancel reply").apply {
+            applyCommentActionStyle(primary = false)
+            addActionListener { hideReplyForm() }
+        }
+        replyFormPanel = JPanel(BorderLayout(0, JBUI.scale(6))).apply {
+            isOpaque = false
+            isVisible = false
+            alignmentX = LEFT_ALIGNMENT
+            border = JBUI.Borders.emptyTop(8)
+            add(createCommentInputScrollPane(replyTextArea), BorderLayout.CENTER)
+            add(JPanel(FlowLayout(FlowLayout.RIGHT, JBUI.scale(8), 0)).apply {
+                isOpaque = false
+                add(cancelReplyButton)
+                add(postReplyButton)
+            }, BorderLayout.SOUTH)
+        }
+        val replyButton = JButton("Reply").apply {
+            applyCommentActionStyle(primary = false)
+            addActionListener { showReplyForm() }
+        }
+        replyActionsPanel = JPanel(FlowLayout(FlowLayout.LEFT, 0, 0)).apply {
+            isOpaque = false
+            alignmentX = LEFT_ALIGNMENT
+            add(replyButton)
+        }
+
+        val centerPanel = JPanel().apply {
+            isOpaque = false
+            layout = BoxLayout(this, BoxLayout.Y_AXIS)
+            add(body.apply { alignmentX = LEFT_ALIGNMENT })
+            add(repliesPanel)
+            add(replyFormPanel)
+        }
+        val southPanel = JPanel().apply {
+            isOpaque = false
+            layout = BoxLayout(this, BoxLayout.Y_AXIS)
+            add(editActionsPanel.apply { alignmentX = LEFT_ALIGNMENT })
+            add(replyActionsPanel)
+        }
+
         val card = RoundedSurfacePanel(COMMENT_SURFACE_BG, COMMENT_BORDER, COMMENT_PANEL_ARC).apply {
             layout = BorderLayout(0, JBUI.scale(10))
             border = JBUI.Borders.empty(10, 14)
             add(header, BorderLayout.NORTH)
-            add(body, BorderLayout.CENTER)
-            add(editActionsPanel, BorderLayout.SOUTH)
+            add(centerPanel, BorderLayout.CENTER)
+            add(southPanel, BorderLayout.SOUTH)
         }
 
         add(card, BorderLayout.CENTER)
+        renderReplies()
+    }
+
+    private fun renderReplies() {
+        repliesPanel.removeAll()
+        comment.thread().forEach { reply ->
+            repliesPanel.add(createReplyBlock(reply, editor))
+        }
+    }
+
+    private fun showReplyForm() {
+        if (!replyFormPanel.isVisible) {
+            replyTextArea.text = ""
+            replyFormPanel.isVisible = true
+            refreshLayout()
+        }
+        replyTextArea.requestFocusInWindow()
+    }
+
+    private fun hideReplyForm() {
+        replyFormPanel.isVisible = false
+        refreshLayout()
+    }
+
+    private fun submitReply() {
+        val text = replyTextArea.text.trim()
+        if (text.isNotEmpty()) {
+            ReviewManagerService.getInstance(project).addReply(comment.id, text)
+            renderReplies()
+        }
+        hideReplyForm()
+    }
+
+    private fun refreshLayout() {
+        revalidate()
+        repaint()
+        inlayRef?.update()
     }
 
     private fun enterEditMode() {
@@ -427,6 +528,52 @@ private fun createCommentInputScrollPane(textArea: JBTextArea): JScrollPane = JS
     viewport.background = INPUT_BG
     viewport.isOpaque = true
     horizontalScrollBarPolicy = ScrollPaneConstants.HORIZONTAL_SCROLLBAR_NEVER
+}
+
+private val REPLY_TIMESTAMP_FORMAT: DateTimeFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")
+
+/**
+ * Renders a stored ISO-8601 [CommentReply.createdAt] as `yyyy-MM-dd HH:mm:ss` for display.
+ *
+ * The recorded wall-clock time is kept as-is rather than converted to the JVM's default zone, so the
+ * rendered value does not depend on where the IDE happens to be running. Unparseable input is
+ * returned unchanged, so a hand-edited archive degrades to showing the raw string instead of
+ * breaking the inlay.
+ */
+internal fun formatReplyTimestamp(raw: String): String =
+    runCatching { OffsetDateTime.parse(raw).toLocalDateTime() }
+        .recoverCatching { LocalDateTime.parse(raw) }
+        .map { it.format(REPLY_TIMESTAMP_FORMAT) }
+        .getOrDefault(raw)
+
+private fun createReplyBlock(reply: CommentReply, editor: EditorEx): JPanel {
+    val header = JLabel("${reply.author} · ${formatReplyTimestamp(reply.createdAt)}").apply {
+        foreground = SUBTLE_TEXT
+        if (reply.kind == ReplyKind.RESOLUTION) {
+            icon = IconUtil.colorize(AllIcons.Actions.Checked, BLUE_BORDER, false, false)
+        }
+    }
+    val bodyArea = JBTextArea(reply.body).apply {
+        isEditable = false
+        lineWrap = true
+        wrapStyleWord = true
+        border = JBUI.Borders.empty(2, 0)
+        background = COMMENT_SURFACE_BG
+        foreground = editor.colorsScheme.defaultForeground
+    }
+    return JPanel(BorderLayout(0, JBUI.scale(2))).apply {
+        isOpaque = false
+        alignmentX = JPanel.LEFT_ALIGNMENT
+        border = JBUI.Borders.compound(
+            JBUI.Borders.emptyTop(8),
+            JBUI.Borders.compound(
+                JBUI.Borders.customLine(COMMENT_BORDER, 0, 2, 0, 0),
+                JBUI.Borders.emptyLeft(10),
+            ),
+        )
+        add(header, BorderLayout.NORTH)
+        add(bodyArea, BorderLayout.CENTER)
+    }
 }
 
 private fun createPillLabel(text: String): JComponent = JPanel(FlowLayout(FlowLayout.LEFT, 0, 0)).apply {

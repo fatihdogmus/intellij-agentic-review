@@ -58,6 +58,7 @@ data class ReviewComment(
     var updatedAt: String = "",
     var author: String? = null,
     var agentMetadata: AgentMetadata? = null,
+    var replies: MutableList<CommentReply> = mutableListOf(),
 )
 
 @Serializable
@@ -81,6 +82,60 @@ data class AgentMetadata(
     var message: String? = null,
     var runId: String? = null,
 )
+
+@Serializable
+data class CommentReply(
+    var id: String = "",
+    var commentId: String = "",
+    var author: String = "",
+    var authorKind: ReplyAuthorKind = ReplyAuthorKind.HUMAN,
+    var kind: ReplyKind = ReplyKind.COMMENT,
+    var body: String = "",
+    var createdAt: String = "",
+    var runId: String? = null,
+)
+
+@Serializable(with = ReplyAuthorKindSerializer::class)
+enum class ReplyAuthorKind {
+    HUMAN,
+    AGENT,
+}
+
+@Serializable(with = ReplyKindSerializer::class)
+enum class ReplyKind {
+    COMMENT,
+    RESOLUTION,
+}
+
+object ReplyAuthorKindSerializer : KSerializer<ReplyAuthorKind> {
+    override val descriptor: SerialDescriptor =
+        PrimitiveSerialDescriptor("ReplyAuthorKind", PrimitiveKind.STRING)
+
+    override fun serialize(encoder: Encoder, value: ReplyAuthorKind) {
+        encoder.encodeString(value.name)
+    }
+
+    override fun deserialize(decoder: Decoder): ReplyAuthorKind =
+        when (decoder.decodeString()) {
+            ReplyAuthorKind.AGENT.name -> ReplyAuthorKind.AGENT
+            else -> ReplyAuthorKind.HUMAN
+        }
+}
+
+object ReplyKindSerializer : KSerializer<ReplyKind> {
+    override val descriptor: SerialDescriptor =
+        PrimitiveSerialDescriptor("ReplyKind", PrimitiveKind.STRING)
+
+    override fun serialize(encoder: Encoder, value: ReplyKind) {
+        encoder.encodeString(value.name)
+    }
+
+    override fun deserialize(decoder: Decoder): ReplyKind =
+        when (decoder.decodeString()) {
+            ReplyKind.RESOLUTION.name -> ReplyKind.RESOLUTION
+            else -> ReplyKind.COMMENT
+        }
+}
 
 @Serializable
 enum class ReviewStatus {
@@ -116,3 +171,21 @@ enum class DiffSide {
 }
 
 fun ReviewTarget.commitHashIfAny(): String? = commitHash
+
+fun ReviewComment.thread(): List<CommentReply> {
+    if (replies.isNotEmpty()) return replies.toList()
+    val legacy = agentMetadata ?: return emptyList()
+    val message = legacy.message?.takeIf { it.isNotBlank() } ?: return emptyList()
+    return listOf(
+        CommentReply(
+            id = "legacy-$id",
+            commentId = id,
+            author = legacy.addressedBy ?: "agent",
+            authorKind = ReplyAuthorKind.AGENT,
+            kind = ReplyKind.RESOLUTION,
+            body = message,
+            createdAt = legacy.addressedAt ?: createdAt,
+            runId = legacy.runId,
+        ),
+    )
+}
