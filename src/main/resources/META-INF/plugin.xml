@@ -1,7 +1,7 @@
 <idea-plugin>
     <id>dev.fatihdogmus.agenticreview</id>
     <name>Agentic Review</name>
-    <version>1.0.1</version>
+    <version>1.1.0</version>
     <vendor>Internal</vendor>
     <description><![CDATA[
         <p>Agentic Review brings a lightweight, PR-style review workflow into IntelliJ IDEA without requiring a remote pull request.</p>
