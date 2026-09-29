@@ -15,6 +15,8 @@ data class SavedReviewArchive(
     val beginCommit: String? = null,
     val endCommit: String? = null,
     val subject: String? = null,
+    val branchName: String? = null,
+    val baseBranchName: String? = null,
     val reviewStatus: ReviewStatus = ReviewStatus.OPEN,
     val createdAt: String,
     val updatedAt: String,

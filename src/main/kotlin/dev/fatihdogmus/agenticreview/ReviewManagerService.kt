@@ -173,6 +173,8 @@ class ReviewManagerService(private val project: Project) : Disposable {
                 baseRef = metadata.mergeBase,
                 headRef = metadata.headHash,
                 subject = "${metadata.currentBranch} vs ${metadata.baseBranch}",
+                branchName = metadata.currentBranch,
+                baseBranchName = metadata.baseBranch,
             ),
             repositoryRoot = metadata.repositoryRoot,
             createdAt = nowIso(),
@@ -181,6 +183,30 @@ class ReviewManagerService(private val project: Project) : Disposable {
         stateService.addReview(review)
         openReview(review.id)
         return review
+    }
+
+    fun canRefreshBranchReview(review: Review?): Boolean = review?.target?.let { target ->
+        target.type == ReviewTargetType.COMMIT_RANGE &&
+            (target.branchName != null && target.baseBranchName != null ||
+                // Branch reviews created before branch identity was stored used this subject.
+                target.subject?.matches(Regex(".+ vs (main|master)")) == true)
+    } == true
+
+    fun refreshBranchReview(reviewId: String): Boolean {
+        val review = findReview(reviewId)?.takeIf(::canRefreshBranchReview) ?: return false
+        val metadata = branchReviewMetadataProvider() ?: return false
+        if (review.repositoryRoot != metadata.repositoryRoot) return false
+        val branchName = review.target.branchName ?: review.target.subject?.substringBeforeLast(" vs ")
+        val baseBranchName = review.target.baseBranchName ?: review.target.subject?.substringAfterLast(" vs ")
+        if (branchName != metadata.currentBranch || baseBranchName != metadata.baseBranch) return false
+
+        review.target.baseRef = metadata.mergeBase
+        review.target.headRef = metadata.headHash
+        review.target.branchName = metadata.currentBranch
+        review.target.baseBranchName = metadata.baseBranch
+        // The file snapshots will be reloaded by the panel; keep comments and review identity.
+        touch(review)
+        return true
     }
 
     fun canSaveReview(review: Review?): Boolean = review != null && review.target.type != ReviewTargetType.UNCOMMITTED
@@ -205,6 +231,8 @@ class ReviewManagerService(private val project: Project) : Disposable {
             beginCommit = review.target.beginCommit(),
             endCommit = review.target.endCommit(),
             subject = review.target.subject,
+            branchName = review.target.branchName,
+            baseBranchName = review.target.baseBranchName,
             reviewStatus = review.status,
             createdAt = review.createdAt,
             updatedAt = review.updatedAt,
@@ -561,6 +589,8 @@ private fun SavedReviewArchive.toReviewTarget(): ReviewTarget = when (targetType
         baseRef = beginCommit,
         headRef = endCommit,
         subject = subject,
+        branchName = branchName,
+        baseBranchName = baseBranchName,
     )
 
     ReviewTargetType.UNCOMMITTED -> ReviewTarget(type = ReviewTargetType.UNCOMMITTED)

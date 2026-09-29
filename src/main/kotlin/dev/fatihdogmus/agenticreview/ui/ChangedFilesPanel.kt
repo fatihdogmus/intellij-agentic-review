@@ -46,6 +46,7 @@ class ChangedFilesPanel {
     private var reviewFiles: List<ChangedFile> = emptyList()
     private var turnFilesById: Map<String, List<ChangedFile>> = emptyMap()
     private var seenFileKeys: Set<String> = emptySet()
+    private var commentCounts: Map<String, Int> = emptyMap()
     private var selectedFilePath: String? = null
     private var turnsEnabled = false
     private val titleLabel = JBLabel("Changed Files")
@@ -58,9 +59,12 @@ class ChangedFilesPanel {
     val component: JComponent = JBPanel<JBPanel<*>>(BorderLayout())
 
     init {
-        tree.cellRenderer = ChangedFileTreeRenderer { changedFile ->
-            if (selectedTurn() != null) null else changedFile.seenKey() !in seenFileKeys
-        }
+        tree.cellRenderer = ChangedFileTreeRenderer(
+            unseenState = { changedFile ->
+                if (selectedTurn() != null) null else changedFile.seenKey() !in seenFileKeys
+            },
+            commentCount = { changedFile -> commentCounts[changedFile.filePath] ?: 0 },
+        )
         tree.isRootVisible = false
         tree.showsRootHandles = true
         tree.emptyText.text = "No changed files"
@@ -116,13 +120,17 @@ class ChangedFilesPanel {
         files: List<ChangedFile>,
         selectedFilePath: String?,
         seenFileKeys: Set<String>,
+        commentCounts: Map<String, Int> = emptyMap(),
     ) {
         this.reviewFiles = files
         this.selectedFilePath = selectedFilePath
         this.seenFileKeys = seenFileKeys
+        this.commentCounts = commentCounts
         val item = turnCombo.selectedItem as? TurnComboItem
         if (item == null || item.turn == null) {
             refreshModel(autoSelectFirst = true, notifySelection = false)
+        } else {
+            tree.repaint()
         }
     }
 
@@ -347,6 +355,7 @@ private data class FileNode(
 
 private class ChangedFileTreeRenderer(
     private val unseenState: (ChangedFile) -> Boolean?,
+    private val commentCount: (ChangedFile) -> Int,
 ) : ColoredTreeCellRenderer() {
     private val addedColor = JBColor(0x1A7F37, 0x3FB950)
     private val deletedColor = JBColor(0xCF222E, 0xF85149)
@@ -361,6 +370,7 @@ private class ChangedFileTreeRenderer(
         row: Int,
         hasFocus: Boolean,
     ) {
+        toolTipText = null
         val userObject = (value as? DefaultMutableTreeNode)?.userObject
         when (userObject) {
             is DirectoryNode -> renderDirectory(userObject)
@@ -383,6 +393,11 @@ private class ChangedFileTreeRenderer(
 
         icon = fileType.icon
         append(if (unseen == true) "* $name" else name, textAttributes)
+        val comments = commentCount(file)
+        if (comments > 0) {
+            append("  🗨︎ $comments", SimpleTextAttributes.GRAYED_ATTRIBUTES)
+            toolTipText = "$comments ${if (comments == 1) "comment" else "comments"}"
+        }
         append("  ${statusText(file.status)}", statusAttributes(file.status))
         append("  +${lineStats.added}", SimpleTextAttributes(SimpleTextAttributes.STYLE_PLAIN, addedColor))
         append(" -${lineStats.deleted}", SimpleTextAttributes(SimpleTextAttributes.STYLE_PLAIN, deletedColor))

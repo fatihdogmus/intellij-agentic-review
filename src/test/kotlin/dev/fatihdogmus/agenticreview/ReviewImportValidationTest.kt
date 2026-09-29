@@ -155,6 +155,27 @@ class ReviewImportValidationTest {
         assertThat(review.comments.single().reviewId).isEqualTo(review.id)
     }
 
+    @Test
+    fun loadReviewFromFilePreservesBranchReviewIdentity() {
+        val manager = configuredManager()
+        val file = writeArchive(
+            validCommitRangeArchive().copy(
+                subject = "feature/test vs main",
+                branchName = "feature/test",
+                baseBranchName = "main",
+            ),
+            "valid-branch.json",
+        )
+
+        val result = manager.loadReviewFromFile(file)
+
+        assertThat(result.ok).isTrue()
+        val review = manager.findReview(result.reviewId!!)
+        assertThat(review?.target?.branchName).isEqualTo("feature/test")
+        assertThat(review?.target?.baseBranchName).isEqualTo("main")
+        assertThat(manager.canRefreshBranchReview(review)).isTrue()
+    }
+
     private fun configuredManager(): ReviewManagerService = ReviewManagerService.getInstance(project).also { manager ->
         val tempDir = Files.createTempDirectory("agentic-review-import-tests")
         manager.repositoryRootResolver = { tempDir.toString() }

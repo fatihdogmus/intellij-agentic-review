@@ -37,6 +37,8 @@ data class ReviewTarget(
     var parentHash: String? = null,
     var subject: String? = null,
     var changelistId: String? = null,
+    var branchName: String? = null,
+    var baseBranchName: String? = null,
 )
 
 @Serializable

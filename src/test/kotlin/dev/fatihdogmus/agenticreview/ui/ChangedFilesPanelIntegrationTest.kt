@@ -111,6 +111,31 @@ class ChangedFilesPanelIntegrationTest {
     }
 
     @Test
+    fun treeRendererShowsCommentCountNextToFileName() {
+        onEdt {
+            val panel = ChangedFilesPanel()
+            panel.setReviewFiles(
+                listOf(sampleChangedFile("src/Foo.kt"), sampleChangedFile("src/Bar.kt")),
+                selectedFilePath = null,
+                seenFileKeys = emptySet(),
+                commentCounts = mapOf("src/Foo.kt" to 2),
+            )
+
+            val rows = treeRowTexts(reviewTree(panel))
+            assertThat(rows).anyMatch { it.contains("Foo.kt  🗨︎ 2  M  +") }
+            assertThat(rows).anyMatch { it.contains("Bar.kt") && !it.contains("🗨︎") }
+
+            panel.setReviewFiles(
+                listOf(sampleChangedFile("src/Foo.kt")),
+                selectedFilePath = null,
+                seenFileKeys = emptySet(),
+                commentCounts = mapOf("src/Foo.kt" to 1),
+            )
+            assertThat(treeRowTexts(reviewTree(panel))).anyMatch { it.contains("Foo.kt  🗨︎ 1  M") }
+        }
+    }
+
+    @Test
     fun treeCompactsSingleChildDirectoryChains() {
         onEdt {
             val panel = ChangedFilesPanel()

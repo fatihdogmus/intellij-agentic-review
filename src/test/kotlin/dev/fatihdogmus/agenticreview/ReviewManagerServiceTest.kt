@@ -430,7 +430,82 @@ class ReviewManagerServiceTest {
         assertThat(review.target.baseRef).isEqualTo("merge-base-123")
         assertThat(review.target.headRef).isEqualTo("head-456")
         assertThat(review.target.subject).isEqualTo("feature/test vs main")
+        assertThat(review.target.branchName).isEqualTo("feature/test")
+        assertThat(review.target.baseBranchName).isEqualTo("main")
         assertThat(review.title).isEqualTo("feature/test vs main")
+    }
+
+    @Test
+    fun refreshBranchReviewUpdatesRangeWithoutLosingCommentsOrIdentity() {
+        val manager = ReviewManagerService.getInstance(project)
+        manager.branchReviewMetadataProvider = { sampleBranchReviewMetadata() }
+        val review = manager.createBranchReview()
+        manager.addComment(review.id, sampleChangedFile("src/Foo.kt"), DiffSide.RIGHT, 1, "keep")
+        val commentId = review.comments.single().id
+        manager.markFileSeen(review.id, sampleChangedFile("src/Foo.kt"))
+        manager.branchReviewMetadataProvider = {
+            sampleBranchReviewMetadata().copy(mergeBase = "new-base", headHash = "new-head")
+        }
+
+        assertThat(manager.canRefreshBranchReview(review)).isTrue()
+        assertThat(manager.refreshBranchReview(review.id)).isTrue()
+
+        assertThat(manager.findReview(review.id)).isSameAs(review)
+        assertThat(review.target.baseRef).isEqualTo("new-base")
+        assertThat(review.target.headRef).isEqualTo("new-head")
+        assertThat(review.comments.single().id).isEqualTo(commentId)
+        assertThat(review.seenFiles).hasSize(1)
+        assertThat(manager.currentReviewId).isEqualTo(review.id)
+    }
+
+    @Test
+    fun refreshBranchReviewRejectsOtherTargetsAndDifferentBranches() {
+        val manager = ReviewManagerService.getInstance(project)
+        manager.branchReviewMetadataProvider = { sampleBranchReviewMetadata() }
+        val branchReview = manager.createBranchReview()
+        val commitReview = seededCommitReview("not-refreshable")
+        val rangeReview = branchReview.copy(
+            id = "ordinary-range",
+            target = ReviewTarget(type = ReviewTargetType.COMMIT_RANGE, baseRef = "base", headRef = "head"),
+        )
+        assertThat(manager.canRefreshBranchReview(null)).isFalse()
+        assertThat(manager.canRefreshBranchReview(commitReview)).isFalse()
+        assertThat(manager.canRefreshBranchReview(rangeReview)).isFalse()
+        assertThat(manager.refreshBranchReview(rangeReview.id)).isFalse()
+
+        manager.branchReviewMetadataProvider = {
+            sampleBranchReviewMetadata().copy(currentBranch = "other", headHash = "other-head")
+        }
+        assertThat(manager.refreshBranchReview(branchReview.id)).isFalse()
+        assertThat(branchReview.target.headRef).isEqualTo("head-456")
+    }
+
+    @Test
+    fun refreshOlderBranchReviewAndPreserveBranchIdentityInArchive() {
+        val manager = ReviewManagerService.getInstance(project)
+        val review = Review(
+            id = "legacy-branch",
+            title = "Custom name",
+            target = ReviewTarget(
+                type = ReviewTargetType.COMMIT_RANGE,
+                baseRef = "old-base",
+                headRef = "old-head",
+                subject = "feature/test vs main",
+            ),
+            repositoryRoot = "/tmp/repo",
+            createdAt = "2026-05-07T14:20:00+03:00",
+            updatedAt = "2026-05-07T14:20:00+03:00",
+        )
+        ReviewStateService.getInstance(project).addReview(review)
+        manager.branchReviewMetadataProvider = { sampleBranchReviewMetadata() }
+
+        assertThat(manager.canRefreshBranchReview(review)).isTrue()
+        assertThat(manager.refreshBranchReview(review.id)).isTrue()
+        assertThat(review.title).isEqualTo("Custom name")
+        assertThat(review.target.branchName).isEqualTo("feature/test")
+        val archive = json.decodeFromString<SavedReviewArchive>(manager.prepareSaveReview(review.id, review.title)!!.payload)
+        assertThat(archive.branchName).isEqualTo("feature/test")
+        assertThat(archive.baseBranchName).isEqualTo("main")
     }
 
     @Test

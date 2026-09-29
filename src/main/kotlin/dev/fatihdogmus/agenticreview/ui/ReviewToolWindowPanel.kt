@@ -128,7 +128,12 @@ class ReviewToolWindowPanel(
 
         if (review != null) {
             val files = changedFilesByReviewId[review.id].orEmpty()
-            changedFilesPanel.setReviewFiles(files, manager.currentFilePath, manager.seenFileKeys(review.id))
+            changedFilesPanel.setReviewFiles(
+                files,
+                manager.currentFilePath,
+                manager.seenFileKeys(review.id),
+                commentCounts(review),
+            )
             loadChangedFilesIfNeeded(review)
             refreshDiff()
         } else {
@@ -186,6 +191,7 @@ class ReviewToolWindowPanel(
                     changedFilesByReviewId[reviewId].orEmpty(),
                     manager.currentFilePath,
                     manager.seenFileKeys(reviewId),
+                    review?.let(::commentCounts).orEmpty(),
                 )
             }
         }
@@ -303,13 +309,15 @@ class ReviewToolWindowPanel(
             }
 
             override fun onSuccess() {
+                if (requestId != changedFilesLoadSequence.get()) return
                 changedFilesByReviewId[review.id] = changedFiles
                 manager.syncSeenFiles(review.id, changedFiles, notify = false)
-                if (requestId == changedFilesLoadSequence.get() && manager.currentReviewId == review.id) {
+                if (manager.currentReviewId == review.id) {
                     changedFilesPanel.setReviewFiles(
                         changedFiles,
                         manager.currentFilePath,
-                        manager.seenFileKeys(review.id)
+                        manager.seenFileKeys(review.id),
+                        commentCounts(review),
                     )
                     refreshDiff()
                 }
@@ -331,6 +339,9 @@ class ReviewToolWindowPanel(
             secondComponent = center
         }
     }
+
+    private fun commentCounts(review: Review): Map<String, Int> =
+        review.comments.groupingBy { it.filePath }.eachCount()
 
     private fun createReviewSelectorPanel(): JComponent = createCardPanel().apply {
         border = JBUI.Borders.compound(
@@ -413,6 +424,15 @@ class ReviewToolWindowPanel(
 
     private fun showEditReviewMenu() {
         val group = DefaultActionGroup().apply {
+            add(object : DumbAwareAction("Refresh Branch Review") {
+                override fun actionPerformed(event: AnActionEvent) {
+                    refreshSelectedBranchReview()
+                }
+
+                override fun update(event: AnActionEvent) {
+                    event.presentation.isEnabled = manager.canRefreshBranchReview(selectedReview())
+                }
+            })
             add(object : DumbAwareAction("Rename") {
                 override fun actionPerformed(event: AnActionEvent) {
                     renameSelectedReview()
@@ -544,6 +564,32 @@ class ReviewToolWindowPanel(
         runReviewCreationTask("Creating branch review") {
             manager.createBranchReview()
         }
+    }
+
+    private fun refreshSelectedBranchReview() {
+        val review = selectedReview()?.takeIf(manager::canRefreshBranchReview) ?: return
+        object : Task.Backgroundable(project, "Refreshing branch review", false) {
+            private var refreshed = false
+
+            override fun run(indicator: ProgressIndicator) {
+                refreshed = manager.refreshBranchReview(review.id)
+            }
+
+            override fun onSuccess() {
+                if (!refreshed) {
+                    Messages.showWarningDialog(
+                        project,
+                        "Switch to the review's branch and make sure its base branch is available.",
+                        "Refresh Branch Review",
+                    )
+                    return
+                }
+                changedFilesLoadSequence.incrementAndGet()
+                changedFilesByReviewId.remove(review.id)
+                diffRequestCache.clear()
+                refreshUi()
+            }
+        }.queue()
     }
 
     private fun copyPrompt() {
