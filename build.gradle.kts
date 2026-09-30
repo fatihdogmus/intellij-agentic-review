@@ -18,7 +18,7 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.9.0")
     implementation("org.valiktor:valiktor-core:0.12.0")
     testImplementation("org.junit.jupiter:junit-jupiter:5.12.2")
-    testImplementation("org.junit.platform:junit-platform-launcher:1.12.2")
+    testImplementation("org.junit.platform:junit-platform-launcher:6.1.0")
     testImplementation("org.opentest4j:opentest4j:1.3.0")
     testImplementation("org.assertj:assertj-core:3.27.3")
     testRuntimeOnly("junit:junit:4.13.2")
