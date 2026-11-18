@@ -34,11 +34,9 @@
 - `runIde` enables MCP by default with `-Dlocal.review.enable.mcp.by.default=true`.
 - `ReviewMcpToolset` returns JSON strings, not raw Kotlin objects. Keep that contract if you touch MCP methods.
 
-## OpenCode plugin publish
-- The `agentic-review` opencode plugin lives at `packages/agentic-review/` as an npm package named `opencode-agentic-review`.
-- Publish via `.github/workflows/publish-agentic-review-plugin.yml`: `workflow_dispatch` with `patch`/`minor`/`major` — bumps version in `package.json`, builds TS → JS, publishes to npm, tags `agentic-review-vX.Y.Z`.
-- Requires `NPM_TOKEN` secret with npm publish permissions.
-- Local development copy stays at `.opencode/plugins/agentic-review.ts`; the npm package source in `src/index.ts` adds a `default` export.
+## OpenCode plugin
+- The OpenCode plugin that records turn snapshots is `@fatihdogmus/opencode-agentic-review`. Its source, tests, and releases live in `packages/agentic-review` of https://github.com/fatihdogmus/opencode-plugins, not in this repository.
+- It calls `review_turn_snapshot_begin` and `review_turn_snapshot_end` over MCP. Keep those tools' names and parameters compatible, or change the plugin in that repository alongside them.
 
 ## Tests
 - Tests use IntelliJ Platform test framework with `@TestApplication` and `projectFixture()`; see `src/test/kotlin/dev/agentreview/intellij/ReviewManagerServiceTest.kt` for the standard pattern.

@@ -132,7 +132,9 @@ The seen state is keyed to the file's content hash, so if the underlying file ch
 
 ## Turn Snapshots
 
-The opencode plugin at `.opencode/plugins/agentic-review.ts` hooks into opencode's session lifecycle and records each agent step as a **turn snapshot**. A turn captures which files the agent changed (via `edit`, `write`, `apply_patch`, `bash` tool calls), when it started and ended, and what tool calls it made.
+The [`@fatihdogmus/opencode-agentic-review`](https://github.com/fatihdogmus/opencode-plugins/tree/main/packages/agentic-review) OpenCode plugin records each agent turn as a **turn snapshot**. A turn is one run of the agent, from its first model step until it succeeds, fails, or is interrupted. It captures which files the agent changed (through OpenCode's `write`, `edit`, and `patch` tools), when the turn started and ended, and which tool calls it made, including `shell` calls.
+
+Install it in OpenCode V2 with `opencode plugin add @fatihdogmus/opencode-agentic-review`. It needs the IDE's built-in MCP server; see the plugin's README for options.
 
 <put_example_ss_of_turn_dropdown_here>
 
